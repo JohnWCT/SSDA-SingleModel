@@ -1,0 +1,64 @@
+### Core Python / notebook artifacts (from DAPL-master)
+__pycache__/
+*.py[cod]
+*.so
+.ipynb_checkpoints/
+
+### Jupyter notebooks (project uses Python scripts instead)
+*.ipynb
+
+### Virtual environments / local env
+.env
+.venv/
+env/
+venv/
+ENV/
+
+### Build / packaging / test caches
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+### IDE / editor local configs
+.idea/
+.cursor/
+.vscode/
+
+### SSDA4Drug — training outputs (regenerable)
+save/
+outputs/
+
+### SSDA4Drug — datasets (regenerable via preprocess_benchmark.py)
+Datasets/rawData/
+Datasets/processedData/
+
+### DAPL-style project outputs
+data/
+weights/
+outputs/
+result/
+finetune_result/
+data_Winnie/
+output_dir/
+
+### Large model / checkpoint / latent artifacts
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.bin
+*.safetensors
+*.pkl
+*.pickle
+*.joblib
+*.npz
+*.npy
+
+### Optional: large extended cell-line bundles (uncomment if needed)
+# Extended/

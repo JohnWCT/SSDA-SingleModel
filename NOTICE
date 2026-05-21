@@ -1,0 +1,32 @@
+SSDA-SingleModel
+Copyright (c) 2026 JohnWCT
+
+This project is licensed under the MIT License. See the LICENSE file in this
+repository for the full license text.
+
+---
+
+Attribution — upstream SSDA4Drug
+
+Portions of this repository are derived from or inspired by SSDA4Drug:
+
+  Repository: https://github.com/hliulab/SSDA4Drug
+  Reference:  Semi-supervised deep transfer learning for single-cell drug response
+              prediction (SSDA4Drug framework)
+
+The following components retain the upstream design and training logic unless
+otherwise noted in docs/:
+
+  - experiment_shot.py, trainer.py, model.py, utils.py
+  - Benchmark/ baseline implementations
+  - Datasets/preprocess_benchmark.py and related preprocessing workflow
+
+Modifications in this repository (non-exhaustive):
+
+  - ssda_latent/ package and experiment_shot_ssda.py (latent export, 5-fold CV)
+  - Documentation under docs/
+  - Python script replacements for legacy Datasets/*.ipynb notebooks
+
+If you redistribute this software, please retain this NOTICE file together with
+LICENSE and acknowledge both JohnWCT (this repository) and the original
+SSDA4Drug authors.
