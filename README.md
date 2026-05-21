@@ -104,16 +104,24 @@ docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug/SSDA4Drug-main 2>/dev/null ||
 |---|---|---|
 | 重複 seed | 50 次迴圈 | 單一 `--random_seed` |
 | Source 切分 | 80/20 train/val | 10% stratified test + `--n_splits` fold CV |
-| 輸出 | `save/results/sc/` 等 | 另加 `save/latent_ssda/<drug>/seed_<seed>/`（latent pkl、預測 CSV、t-SNE、FID/MMD 等） |
+| 輸出 | `save/results/sc/` 等 | 預設寫入 `outputs/`（可用 `--output_dir` 指定根目錄） |
 
-Docker 內快速驗證（2 epoch、2 fold）：
+預設目錄結構（`--output_dir outputs`）：
+
+- `outputs/latent_ssda/<drug>/seed_<seed>/` — latent pkl、預測 CSV、t-SNE、FID/MMD 等
+- `outputs/legacy/results/sc/` — 訓練 AUC 日誌（與原版相容路徑風格）
+- `outputs/legacy/sc/all_path/` — legacy checkpoint（若 `--save_legacy_outputs`）
+
+Docker 內快速驗證（2 epoch）：
 
 ```bash
 docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug; python experiment_shot_ssda.py \
   --drug Gefitinib --n 3 --encoder DAE --epochs 2 \
   --random_seed 42 --source_test_size 0.1 --n_splits 5 \
-  --latent_output_dir save/latent_ssda'
+  --output_dir outputs'
 ```
+
+自訂輸出根目錄範例：`--output_dir /workspace/SSDA4Drug/runs/exp01`；若只要改 latent 路徑可加 `--latent_output_dir ...`。
 
 開發依賴（僅容器內安裝即可）：
 

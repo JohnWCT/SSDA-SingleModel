@@ -46,6 +46,14 @@ class CancerTypeRegistry:
             return self.source_map.get(sid, UNKNOWN_LABEL)
         return self.target_map.get(sid, UNKNOWN_LABEL)
 
+    def combined_map(self) -> dict[str, str]:
+        return {**self.source_map, **self.target_map}
+
+    def samples_with_cancer_type(self, sample_ids: list[str]) -> list[str]:
+        """Sample IDs that have an aligned cancer type (exclude policy drops others)."""
+        cmap = self.combined_map()
+        return [sid for sid in sample_ids if sid in cmap]
+
 
 def _resolve_col(df: pd.DataFrame, col: str) -> str:
     if col in df.columns:
@@ -165,6 +173,17 @@ def build_registry(
         reports=(src_rep, tgt_rep),
         is_available=is_available,
     )
+
+
+def cancer_type_label(
+    sample_id: str, mapping: dict[str, str], policy: str
+) -> str | None:
+    sid = str(sample_id)
+    if sid in mapping:
+        return mapping[sid]
+    if policy == "unknown":
+        return UNKNOWN_LABEL
+    return None
 
 
 def reports_to_dataframe(registry: CancerTypeRegistry) -> pd.DataFrame:

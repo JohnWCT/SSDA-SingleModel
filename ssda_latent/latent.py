@@ -10,7 +10,17 @@ from torch import Tensor, nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
-def get_encoder_latent(encoder: nn.Module, x: Tensor) -> Tensor:
+def get_encoder_latent(
+    encoder: nn.Module, x: Tensor, *, deterministic: bool = True
+) -> Tensor:
+    """Return bottleneck features for latent export and prediction.
+
+    When ``deterministic`` is True and the encoder is a DAE, use the clean
+    AE bottleneck (``encoder.ae.encode``) instead of ``DAE.forward()``, which
+    applies a random denoising mask even in eval mode.
+    """
+    if deterministic and hasattr(encoder, "ae"):
+        return cast(Tensor, encoder.ae.encode(x))
     out = encoder(x)
     if isinstance(out, tuple):
         return cast(Tensor, out[0])

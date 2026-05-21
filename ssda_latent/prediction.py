@@ -15,9 +15,10 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-import model as m
 import utils
+from ssda_latent.cancer_type import cancer_type_label
 from ssda_latent.config import ExperimentConfig
+from ssda_latent.latent import get_encoder_latent
 from ssda_latent.split import SampleSplit, SplitManifest, source_split_for_fold
 
 
@@ -29,8 +30,9 @@ def predict_dataframe(
     device: torch.device,
     batch_size: int,
 ) -> pd.DataFrame:
-    net = m.Test_Double_Model(predictor=predictor, encoder=encoder, adentropy_p=adentropy_p)
-    net.eval()
+    encoder.eval()
+    predictor.eval()
+    adentropy_p.eval()
     sample_ids = x_df.index.astype(str).tolist()
     x_tensor = torch.FloatTensor(x_df.values)
     loader = DataLoader(TensorDataset(x_tensor), batch_size=batch_size, shuffle=False)
@@ -38,7 +40,9 @@ def predict_dataframe(
     with torch.no_grad():
         for (batch_x,) in loader:
             batch_x = batch_x.to(device)
-            logits = net(batch_x)
+            feature = get_encoder_latent(encoder, batch_x, deterministic=True)
+            hidden = predictor(feature)
+            logits = adentropy_p(hidden)
             probs = nn.Softmax(dim=1)(logits).cpu().numpy()
             probs_list.append(probs)
     probs_all = np.vstack(probs_list)
@@ -99,7 +103,9 @@ def build_prediction_table(
                 "fold": fold_index,
                 "seed": config.random_seed,
                 "drug": config.drug,
-                "cancer_type": (cancer_map or {}).get(sid, "Unknown"),
+                "cancer_type": cancer_type_label(
+                    sid, cancer_map or {}, config.missing_cancer_type_policy
+                ),
             }
         )
     return pd.DataFrame(rows)

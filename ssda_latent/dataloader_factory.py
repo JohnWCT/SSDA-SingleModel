@@ -47,8 +47,8 @@ def _source_train_loader(
     x_tr, y_tr = _subset_xy(x_source, y_source, train_ids)
     class_sample_count = np.array(
         [
-            Counter(y_source["response"])[0] / len(y_source["response"]),
-            Counter(y_source["response"])[1] / len(y_source["response"]),
+            Counter(y_tr["response"])[0] / len(y_tr["response"]),
+            Counter(y_tr["response"])[1] / len(y_tr["response"]),
         ]
     )
     weight = 1.0 / class_sample_count

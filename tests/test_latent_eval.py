@@ -7,6 +7,7 @@ import numpy as np
 from ssda_latent.latent_eval import (
     calculate_fid,
     compute_distribution_metrics,
+    tsne_perplexity,
 )
 
 
@@ -20,6 +21,12 @@ def test_distribution_metrics_finite() -> None:
     assert np.isfinite(m["fid_source_target"])
     assert np.isfinite(m["mmd_source_target"])
     assert np.isfinite(m["wasserstein_source_target"])
+
+
+def test_tsne_perplexity_small_n() -> None:
+    assert tsne_perplexity(10) == 3.0
+    assert tsne_perplexity(100) == 30.0
+    assert tsne_perplexity(2) == 2.0
 
 
 def test_fid_same_distribution_low() -> None:

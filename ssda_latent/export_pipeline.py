@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ssda_latent.artifacts import ArtifactWriter
-from ssda_latent.cancer_type import UNKNOWN_LABEL, CancerTypeRegistry
+from ssda_latent.cancer_type import CancerTypeRegistry, cancer_type_label
 from ssda_latent.config import ExperimentConfig
 from ssda_latent.data_loading import ExpressionTables
 from ssda_latent.latent import encode_latent_dict
@@ -62,9 +62,10 @@ class ExportPipeline:
         )
 
         samples = manifest.all_samples(tables)
+        policy = self.config.missing_cancer_type_policy
         cancer_src = self.registry.source_map if self.registry.is_available else {}
         cancer_tgt = self.registry.target_map if self.registry.is_available else {}
-        cancer_all = {**cancer_src, **cancer_tgt}
+        cancer_all = self.registry.combined_map() if self.registry.is_available else {}
 
         src_pred = build_prediction_table(
             src_pred_raw, samples, self.config, fold_index, "source", cancer_src, manifest
@@ -93,7 +94,9 @@ class ExportPipeline:
         kmeans_m = None
         if self.registry.is_available:
             combined_ids = sorted(set(source_latent) | set(target_latent))
-            labels = [cancer_all.get(sid, UNKNOWN_LABEL) for sid in combined_ids]
+            if policy == "exclude":
+                combined_ids = self.registry.samples_with_cancer_type(combined_ids)
+            labels = [cancer_all[sid] for sid in combined_ids]
             plot_tsne_cancer_type(
                 source_latent,
                 target_latent,
@@ -115,7 +118,7 @@ class ExportPipeline:
                     "domain": "source",
                     "split": source_split_for_fold(manifest, fold_index, sid),
                     "response_label": int(tables.y_source.loc[sid, "response"]),
-                    "cancer_type": cancer_all.get(sid, UNKNOWN_LABEL),
+                    "cancer_type": cancer_type_label(sid, cancer_src, policy),
                     "fold": fold_index,
                     "seed": self.config.random_seed,
                     "drug": self.config.drug,
@@ -129,7 +132,7 @@ class ExportPipeline:
                     "domain": "target",
                     "target_role": manifest.target_assignments[sid],
                     "response_label": int(tables.y_target.loc[sid, "response"]),
-                    "cancer_type": cancer_all.get(sid, UNKNOWN_LABEL),
+                    "cancer_type": cancer_type_label(sid, cancer_tgt, policy),
                     "fold": fold_index,
                     "seed": self.config.random_seed,
                     "drug": self.config.drug,

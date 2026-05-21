@@ -25,6 +25,13 @@ from sklearn.metrics import (
 UNKNOWN_LABEL = "Unknown"
 
 
+def tsne_perplexity(n_samples: int) -> float:
+    """Perplexity safe for small combined latent sets (sklearn default 30 needs n > 30)."""
+    if n_samples < 2:
+        return 2.0
+    return float(min(30, max(2, (n_samples - 1) // 3)))
+
+
 def _to_matrix(latent_dict: dict[str, list[float]], sample_ids: list[str]) -> NDArray[np.float64]:
     return np.asarray([latent_dict[sid] for sid in sample_ids], dtype=np.float64)
 
@@ -119,7 +126,12 @@ def plot_tsne_domain(
     output_path: Path,
 ) -> None:
     mat, _, domains = _combined_matrix(source_latent, target_latent)
-    emb = TSNE(n_components=2, random_state=random_state, init="pca").fit_transform(mat)
+    emb = TSNE(
+        n_components=2,
+        random_state=random_state,
+        init="pca",
+        perplexity=tsne_perplexity(mat.shape[0]),
+    ).fit_transform(mat)
     fig, ax = plt.subplots(figsize=(8, 6))
     for domain, color in [("source", "tab:blue"), ("target", "tab:orange")]:
         mask = [d == domain for d in domains]
@@ -142,7 +154,12 @@ def plot_tsne_cancer_type(
         [_latent_vector(source_latent, target_latent, sid) for sid in sample_ids],
         dtype=np.float64,
     )
-    emb = TSNE(n_components=2, random_state=random_state, init="pca").fit_transform(mat)
+    emb = TSNE(
+        n_components=2,
+        random_state=random_state,
+        init="pca",
+        perplexity=tsne_perplexity(mat.shape[0]),
+    ).fit_transform(mat)
     fig, ax = plt.subplots(figsize=(10, 6))
     unique = sorted(set(cancer_labels))
     for ct in unique:

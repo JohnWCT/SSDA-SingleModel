@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 import model as m
-import trainer
+from ssda_latent import safe_trainer
 import utils
 from ssda_latent.config import ExperimentConfig
 from ssda_latent.dataloader_factory import FoldDataLoaders
@@ -56,10 +56,11 @@ def build_para_string(config: ExperimentConfig) -> str:
 
 def build_models(config: ExperimentConfig, device: torch.device) -> ModelBundle:
     bulk_tasks, sc_tasks = utils.cell_dim(drug=config.drug, gene=config.gene)
+    latent_dim = config.latent_dim if config.latent_dim is not None else sc_tasks["pathway"]
     encoder: nn.Module
     if config.encoder == "DAE":
         encoder = m.DAE(
-            input_dim=sc_tasks["pathway"],
+            input_dim=latent_dim,
             fc_dim=256,
             AE_input_dim=bulk_tasks["expression"],
             AE_h_dims=list(config.encoder_h_dims),
@@ -69,14 +70,14 @@ def build_models(config: ExperimentConfig, device: torch.device) -> ModelBundle:
     elif config.encoder == "MLP":
         encoder = m.MLP(
             input_dim=sc_tasks["expression"],
-            latent_dim=sc_tasks["pathway"],
+            latent_dim=latent_dim,
             h_dims=list(config.encoder_h_dims),
             drop_out=config.dropout,
         )
     else:
         raise ValueError("encoder must be DAE or MLP")
     encoder.to(device)
-    predictor = m.Predictor(input_dim=sc_tasks["pathway"], output_dim=32, drop_out=config.dropout)
+    predictor = m.Predictor(input_dim=latent_dim, output_dim=32, drop_out=config.dropout)
     predictor.to(device)
     adentropy_p = m.Predictor_adentropy(num_class=2, inc=32)
     adentropy_p.to(device)
@@ -125,7 +126,7 @@ def train_fold(
     )
     if config.encoder == "DAE":
         assert bundle.fgm is not None
-        encoder_f, predictor_f, adentropy_f = trainer.train_semi_dae(
+        encoder_f, predictor_f, adentropy_f = safe_trainer.train_semi_dae(
             bundle.fgm,
             bundle.encoder,
             bundle.predictor,
@@ -144,7 +145,7 @@ def train_fold(
             auc_path=result_path,
         )
     else:
-        encoder_f, predictor_f, adentropy_f = trainer.train_semi_mlp(
+        encoder_f, predictor_f, adentropy_f = safe_trainer.train_semi_mlp(
             bundle.encoder,
             bundle.predictor,
             bundle.adentropy_p,
@@ -162,7 +163,7 @@ def train_fold(
             auc_path=result_path,
         )
     if config.save_legacy_outputs:
-        ext = ".pth" if config.encoder == "DAE" else "pth"
+        ext = ".pth"
         torch.save(
             {
                 "encoder_state_dict": encoder_f.state_dict(),
