@@ -135,9 +135,34 @@ docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug; pip install pytest mypy ruff
 
 一次輸出所有藥物反應向量 `[batch_size, n_drugs]`；輸入為 **omics CSV + long-format response CSV**（非預先 latent）。
 
-必要參數：`--task_type classification|regression`、`--source_omics_path`、`--target_omics_path`、`--source_response_path`、`--target_response_path`。
+必要參數：`--task_type classification|regression`、`--source_omics_path`、`--target_omics_path`、`--source_response_path`、`--target_response_path`、`--source_response_col`（例如 PRISM 的 `neg_log2_auc`）。
 
-Docker 範例（請替換為實際 response 路徑）：
+欄位約定（**不需**再指定 sample / drug 欄位 CLI）：
+
+| 資料 | 欄位 |
+|------|------|
+| Source omics / PRISM response | `Sample_ID` |
+| Target omics | `tissue_id`（TCGA 四段位，如 `TCGA-AA-3695-01A`） |
+| Target response | `Patient_id` + `Label`（join 時將 `tissue_id` 轉為三段位 patient key） |
+| 藥物 | `drug_name`（PRISM 請先執行 `PYTHONPATH=. python3 scripts/patch_dapl_csv_columns.py`） |
+
+DAPL 範例（掛載 `DAPL-master` 後）：
+
+```bash
+PYTHONPATH=. python3 scripts/patch_dapl_csv_columns.py --dapl-root /workspace/DAPL-master
+
+docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug && python experiment_multilabel_ssda.py \
+  --task_type regression \
+  --source_omics_path /workspace/DAPL-master/data/pretrain_ccle.csv \
+  --target_omics_path /workspace/DAPL-master/data_Winnie/TCGA_impact_hotspot.csv \
+  --source_response_path /workspace/DAPL-master/data_Winnie/PRISM_drug_sensitivity.csv \
+  --target_response_path /workspace/DAPL-master/data/TCGA/PMID27354694_DR_OMICS_ad_intersect_pretrain.csv \
+  --source_response_col neg_log2_auc \
+  --random_seed 42 --n_splits 5 --n_shot 3 --epochs 50 \
+  --output_dir outputs'
+```
+
+Docker 範例（processedData 路徑，請替換 response）：
 
 ```bash
 docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug && python experiment_multilabel_ssda.py \
@@ -147,10 +172,10 @@ docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug && python experiment_multilab
   --source_response_path path/to/source_response_long.csv \
   --target_response_path path/to/target_response_long.csv \
   --random_seed 42 --n_splits 5 --n_shot 3 --epochs 50 \
-  --latent_output_dir save/ssda_multilabel'
+  --output_dir outputs'
 ```
 
-輸出：`save/ssda_multilabel/seed_<seed>/`（`drug_list.csv`、mask 矩陣、各 fold 預測／latent／metrics）。設計說明見 `docs/proposal.md`、`docs/design.md`；實作報告見 `docs/implementation_report.md`。
+預設寫入 `outputs/ssda_multilabel/seed_<seed>/`；可用 `--output_dir outputs` 指定根目錄，或以 `--latent_output_dir` 覆寫完整子路徑。設計說明見 `docs/proposal.md`、`docs/design.md`；實作報告見 `docs/implementation_report.md`。
 
 測試（容器內）：
 

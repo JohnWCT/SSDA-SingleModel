@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from ssda_multilabel.sample_id import sample_match_key
 from ssda_multilabel.schemas import DrugIndex, ResponseMatrix
 
 
@@ -26,6 +27,9 @@ def long_to_response_matrix(
     response_col: str,
     domain: str,
     duplicate_strategy: str = "error",
+    *,
+    omics_sample_id_col: str | None = None,
+    response_sample_id_col: str | None = None,
 ) -> ResponseMatrix:
     sid_col = _resolve_col(response_df, sample_id_col)
     did_col = _resolve_col(response_df, drug_id_col)
@@ -39,7 +43,11 @@ def long_to_response_matrix(
     n_drugs = drug_index.n_drugs
     y = np.zeros((n_samples, n_drugs), dtype=np.float32)
     mask = np.zeros((n_samples, n_drugs), dtype=np.float32)
-    sample_to_row = {sid: i for i, sid in enumerate(sample_ids)}
+    omics_hint = omics_sample_id_col or sample_id_col
+    resp_hint = response_sample_id_col or sample_id_col
+    sample_to_row = {
+        sample_match_key(sid, column_hint=omics_hint): i for i, sid in enumerate(sample_ids)
+    }
 
     dup = df.duplicated(subset=[sid_col, did_col], keep=False)
     if dup.any():
@@ -50,13 +58,13 @@ def long_to_response_matrix(
         df = df.drop_duplicates(subset=[sid_col, did_col], keep="first")
 
     for _, row in df.iterrows():
-        sid = row[sid_col]
-        did = row[did_col]
-        if sid not in sample_to_row or did not in drug_index.drug_to_index:
+        sid_key = sample_match_key(row[sid_col], column_hint=resp_hint)
+        did = str(row[did_col]).strip().lower()
+        if sid_key not in sample_to_row or did not in drug_index.drug_to_index:
             continue
         if pd.isna(row[resp_col]):
             continue
-        i = sample_to_row[sid]
+        i = sample_to_row[sid_key]
         j = drug_index.drug_to_index[did]
         y[i, j] = float(row[resp_col])
         mask[i, j] = 1.0

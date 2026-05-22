@@ -23,27 +23,36 @@ dist/
 *.egg
 
 ### ---------------------------------------------------------------------------
-### Test & static-analysis caches (pytest / mypy / ruff / coverage)
+### Tests — entire directory excluded from git (run locally only)
 ### ---------------------------------------------------------------------------
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.hypothesis/
-.tox/
-.nox/
+tests/
 
+# pytest / unittest caches & reports (repo root)
+.pytest_cache/
+pytest-cache-files*/
+.pytest_tmp/
+pytest-debug.log
+pytest-report.html
+junit.xml
+test-results/
+test-output/
+.nox/
+.tox/
+.hypothesis/
+.benchmarks/
+
+# coverage
 .coverage
 .coverage.*
 coverage.xml
 *.cover
 htmlcov/
-.pytest_tmp/
-pytest-debug.log
+.coveragerc.local
 
-# Local pytest output dirs (if --basetemp or tests write under repo)
-tests/output/
-tests/tmp/
-tests/**/__pycache__/
+# static analysis (dev)
+.mypy_cache/
+.ruff_cache/
+.pytype/
 
 ### ---------------------------------------------------------------------------
 ### SSDA4Drug — program run outputs (regenerable; do not commit)

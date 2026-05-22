@@ -13,8 +13,8 @@ def build_drug_index_from_union(
     target_response: pd.DataFrame,
     drug_id_col: str,
 ) -> DrugIndex:
-    src_drugs = source_response[drug_id_col].astype(str).unique().tolist()
-    tgt_drugs = target_response[drug_id_col].astype(str).unique().tolist()
+    src_drugs = source_response[drug_id_col].astype(str).str.strip().str.lower().unique().tolist()
+    tgt_drugs = target_response[drug_id_col].astype(str).str.strip().str.lower().unique().tolist()
     union = sorted(set(src_drugs) | set(tgt_drugs))
     if not union:
         raise ValueError("drug list is empty after union of source and target")

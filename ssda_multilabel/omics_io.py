@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ssda_multilabel.sample_id import (
+    SOURCE_OMICS_SAMPLE_ID_COL,
+    TARGET_OMICS_SAMPLE_ID_COL,
+)
 from ssda_multilabel.schemas import OmicsTable
 
 
@@ -15,6 +19,17 @@ def _resolve_col(df: pd.DataFrame, col: str) -> str:
     if key in lookup:
         return lookup[key]
     raise ValueError(f"column {col!r} not found in {list(df.columns)}")
+
+
+def resolve_target_omics_sample_id_col(columns: list[str]) -> str:
+    """Target omics must expose ``tissue_id`` (TCGA 4-segment tissue barcode)."""
+    lookup = {str(c).lower(): str(c) for c in columns}
+    key = TARGET_OMICS_SAMPLE_ID_COL.lower()
+    if key in lookup:
+        return lookup[key]
+    raise ValueError(
+        f"target omics requires {TARGET_OMICS_SAMPLE_ID_COL!r} column; got {list(columns)}"
+    )
 
 
 def read_omics_table(path: str, sample_id_col: str, domain: str) -> pd.DataFrame:
