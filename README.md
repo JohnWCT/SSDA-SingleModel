@@ -131,6 +131,33 @@ docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug; pip install pytest mypy ruff
 
 詳見 `docs/design.md`、`docs/IMPLEMENTATION_LOG.md`。
 
+#### 多藥物 Multi-label SSDA（`experiment_multilabel_ssda.py`）
+
+一次輸出所有藥物反應向量 `[batch_size, n_drugs]`；輸入為 **omics CSV + long-format response CSV**（非預先 latent）。
+
+必要參數：`--task_type classification|regression`、`--source_omics_path`、`--target_omics_path`、`--source_response_path`、`--target_response_path`。
+
+Docker 範例（請替換為實際 response 路徑）：
+
+```bash
+docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug && python experiment_multilabel_ssda.py \
+  --task_type classification \
+  --source_omics_path Datasets/processedData/Gefitinib/source_data/source_scaled_tp4k.csv \
+  --target_omics_path Datasets/processedData/Gefitinib/target_data/target_scaled_tp4k.csv \
+  --source_response_path path/to/source_response_long.csv \
+  --target_response_path path/to/target_response_long.csv \
+  --random_seed 42 --n_splits 5 --n_shot 3 --epochs 50 \
+  --latent_output_dir save/ssda_multilabel'
+```
+
+輸出：`save/ssda_multilabel/seed_<seed>/`（`drug_list.csv`、mask 矩陣、各 fold 預測／latent／metrics）。設計說明見 `docs/proposal.md`、`docs/design.md`；實作報告見 `docs/implementation_report.md`。
+
+測試（容器內）：
+
+```bash
+docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug && pytest tests/test_multilabel_*.py -q'
+```
+
 #### 可廢棄的舊流程（重複、僅保留參考）
 
 以下 **Jupyter notebook 與「先跑 split / n-shot 再跑主模型」的舊 README 順序，對 SSDA4Drug 主模型而言已屬重複**，建議改用上列 Python 腳本；notebook 可保留作對照，但**不必再手動執行**：
@@ -160,7 +187,9 @@ python experiment.py --cell <cell_name>
 
 + `experiment_shot.py`: 原版訓練入口（50-seed 迴圈）。
 + `experiment_shot_ssda.py`: 改良版入口（單 seed、source CV、latent 匯出）；呼叫 `ssda_latent/`。
++ `experiment_multilabel_ssda.py`: **多藥物 multi-label SSDA** 入口；呼叫 `ssda_multilabel/`（見下方章節）。
 + `ssda_latent/`: 資料切分、訓練適配、latent/預測/評估匯出管線。
++ `ssda_multilabel/`: 多藥物 long table → wide matrix、mask loss、position-level n-shot、multi-output head。
 + `trainer.py`: The training loop, the hyper-parameters, and the evaluation.
 + `utils.py`: Contains auxiliary, general-purpose, or custom functions, which can be called and used in other parts of the project.
 + `model.py`: Model storage directory.

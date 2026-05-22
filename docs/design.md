@@ -1,826 +1,1832 @@
-# SSDA4Drug Latent 改良版 — 系統架構設計
+# Design: Multi-label / Multi-drug SSDA-SingleModel System Architecture
 
-> **文件狀態**：v1.0（架構設計稿）  
-> **需求來源**：[proposal.md](./proposal.md)  
-> **設計目標**：在保留原版 SSDA4Drug 訓練核心（`trainer.py` / `model.py` / `utils.create_dataset`）的前提下，以**高內聚、低耦合**模組完成 5-fold、latent、prediction 與評估輸出，並支援獨立單元測試。
+## 1. Design Goal
 
----
+本文件根據 `docs/proposal.md`，為 SSDA-SingleModel 的 multi-label / multi-drug 改造版本定義詳細系統架構。
 
-## 1. 架構總覽
-
-### 1.1 設計原則
-
-| 原則 | 說明 |
-|---|---|
-| **核心凍結** | `model.py` 不變；`trainer.py` 僅允許非侵入式擴充（見 §6.3） |
-| **DataLoader 相容** | 訓練仍透過 `utils.create_dataset`；sample ID 在 pandas 層追蹤 |
-| **副作用集中** | 檔案 I/O 統一由 `ArtifactWriter` 負責，業務模組回傳純資料結構 |
-| **可測試** | 切分、對齊、metrics、繪圖模組**不依賴 GPU / 完整訓練** |
-| **向後相容** | 原版 `save/results/sc/`、`save/sc/all_path/` 可選保留（見 AD-05） |
-
-### 1.2 邏輯分層
+新版系統目標是：
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  L4  Entry          experiment_shot.py (薄入口，向後相容)        │
-├─────────────────────────────────────────────────────────────────┤
-│  L3  Orchestration  ssda_latent.orchestrator.ExperimentRunner   │
-├─────────────────────────────────────────────────────────────────┤
-│  L2  Domain         split / cancer_type / train_adapter /       │
-│                     export_pipeline / summary                     │
-├─────────────────────────────────────────────────────────────────┤
-│  L1  Infrastructure config / artifact_writer / seed / paths       │
-├─────────────────────────────────────────────────────────────────┤
-│  L0  Legacy Core    trainer.py, model.py, utils.py (既有)        │
-└─────────────────────────────────────────────────────────────────┘
+omics data table
+  -> SSDA encoder
+  -> sample-level latent representation
+  -> multi-output prediction head
+  -> all-drug response vector
 ```
 
-### 1.3 端到端資料流（單 seed、5-fold）
+核心原則：
 
-```mermaid
-flowchart TB
-    subgraph init [初始化]
-        CLI[CLI Args] --> CFG[ExperimentConfig]
-        CFG --> SEED[SeedManager.set_all]
-        DL[DataLoaderModule.load_tables]
-    end
-
-    subgraph split_once [切分 一次]
-        DL --> SS[SplitModule]
-        SS --> SM[SplitManifest]
-        SS --> CT[CancerTypeModule optional]
-        CT --> CTR[CancerTypeRegistry]
-    end
-
-    subgraph per_fold [每 Fold]
-        SM --> DF[DataLoaderFactory.build_fold_loaders]
-        DF --> TA[TrainingAdapter.train]
-        TA --> CKPT[Checkpoint last epoch]
-        CKPT --> EP[ExportPipeline.run]
-        EP --> ART[ArtifactWriter]
-    end
-
-    subgraph post [彙整]
-        ART --> SUM[SummaryAggregator]
-    end
-
-    init --> split_once
-    split_once --> per_fold
-    per_fold --> post
-```
+1. 使用 raw omics data table 作為模型輸入。
+2. 不使用 drug latent。
+3. 不使用 sample-drug pair model。
+4. 將 source / target response long table 轉為 wide matrix + mask tensor。
+5. multi-output head 一次輸出所有 drug response。
+6. 使用 mask loss 處理 missing labels。
+7. target n-shot 在 sample-drug position level 執行。
+8. 保留 SSDA 的 source supervised + target labeled supervised + target unlabeled adaptation 訓練精神。
+9. 模組間高度獨立、低耦合，方便獨立開發與單元測試。
+10. 每個 fold 輸出 sample-level latent、prediction table、metrics、t-SNE 與 latent distribution evaluation。
 
 ---
 
-## 2. 目錄與套件結構
+## 2. High-level Architecture
 
-### 2.1 建議目錄配置
-
-新增獨立套件目錄，避免根目錄檔案膨脹，並利於 `pytest` 以 package 方式測試：
+### 2.1 System Flow
 
 ```text
-SSDA4Drug-main/
-├── experiment_shot.py          # 薄入口：解析 args → 呼叫 ExperimentRunner
-├── trainer.py                  # L0 凍結（loss 不變）
-├── model.py                    # L0 凍結
-├── utils.py                    # L0 凍結
-├── ssda_latent/                # 新增套件（本設計核心）
-│   ├── __init__.py
-│   ├── config.py               # ExperimentConfig, 參數驗證
-│   ├── seed.py                 # SeedManager
-│   ├── paths.py                # RunLayout 路徑規劃
-│   ├── data_loading.py         # 讀取 processed CSV
-│   ├── split.py                # source test + 5-fold + target few-shot
-│   ├── cancer_type.py          # metadata 對齊
-│   ├── dataloader_factory.py   # 呼叫 utils.create_dataset 的 adapter
-│   ├── training_adapter.py     # 建模、呼叫 train_semi_*
-│   ├── latent.py               # encoder latent 抽取
-│   ├── prediction.py           # 全樣本推論 + classification metrics
-│   ├── latent_eval.py          # t-SNE, FID/MMD/Wasserstein, KMeans
-│   ├── artifacts.py            # ArtifactWriter（統一寫檔）
-│   ├── export_pipeline.py      # 串接 latent + pred + eval
-│   ├── summary.py              # 5-fold 彙整
-│   └── orchestrator.py         # ExperimentRunner 主流程
-├── tests/                      # 單元測試（建議）
-│   ├── test_split.py
-│   ├── test_cancer_type.py
-│   ├── test_latent_eval.py
-│   └── test_prediction_metrics.py
-└── docs/
-    ├── proposal.md
-    └── design.md
+CLI / Config
+  |
+  v
+Data Preparation
+  |
+  |-- read source / target omics
+  |-- read source / target response long tables
+  |-- generate drug_list.csv from source ∪ target
+  |-- build wide response matrices
+  |-- build mask matrices
+  |-- build target n-shot masks
+  |-- build source sample-level splits
+  |
+  v
+Dataset / DataLoader Construction
+  |
+  v
+Model Construction
+  |
+  |-- SSDA encoder
+  |-- multi-output prediction head
+  |
+  v
+Training Engine
+  |
+  |-- source supervised masked loss
+  |-- target labeled masked supervised loss
+  |-- target unlabeled masked adaptation loss
+  |-- validation without parameter update
+  |
+  v
+Prediction / Evaluation
+  |
+  |-- source prediction long table
+  |-- target prediction long table
+  |-- per-drug metrics
+  |-- summary metrics
+  |
+  v
+Latent Export / Visualization
+  |
+  |-- source latent pkl
+  |-- target latent pkl
+  |-- t-SNE domain mixing
+  |-- t-SNE cancer type
+  |-- FID / MMD / Wasserstein
+  |-- KMeans cancer type metrics
+  |
+  v
+Artifact Writer
 ```
-
-> **AD-01（待確認）**：是否接受 `ssda_latent/` 子套件，而非 proposal 中的根目錄 `*_utils.py`？  
-> **本設計預設**：採用 `ssda_latent/`（理由：邊界清晰、可獨立測試、不污染既有 benchmark import 路徑）。
 
 ---
 
-## 3. 模組劃分與職責
+## 3. Package Layout
 
-### 3.1 模組一覽
+建議新增獨立 package：
 
-| 模組 | 檔案 | 職責 | 依賴 | 可單測 |
-|---|---|---|---|:---:|
-| **M1 Config** | `config.py` | CLI → `ExperimentConfig`；驗證 `n`, `n_splits`, paths | argparse, pathlib | ✓ |
-| **M2 Seed** | `seed.py` | 統一設定 PyTorch / NumPy / Python / sklearn seed | torch, numpy, random | ✓ |
-| **M3 Paths** | `paths.py` | `RunLayout`：seed 級、fold 級輸出路徑 | pathlib | ✓ |
-| **M4 DataLoading** | `data_loading.py` | 讀 source/target expression + meta；轉 sample×gene | pandas | ✓ |
-| **M5 Split** | `split.py` | source test、5-fold、target few-shot；產出 `SplitManifest` | pandas, sklearn | ✓ |
-| **M6 CancerType** | `cancer_type.py` | 讀取、normalize、對齊；`CancerTypeRegistry` | pandas | ✓ |
-| **M7 DataLoaderFactory** | `dataloader_factory.py` | 依 manifest 切片 DataFrame → `utils.create_dataset` | utils, torch | △ |
-| **M8 TrainingAdapter** | `training_adapter.py` | 建 encoder/predictor；呼叫 `train_semi_dae/mlp`；存 checkpoint | trainer, model, utils | △ |
-| **M9 Latent** | `latent.py` | `get_encoder_latent`；batch encode；`LatentDict` | torch, model | △ |
-| **M10 Prediction** | `prediction.py` | 全樣本 logits/softmax；metrics 計算 | torch, sklearn | ✓ |
-| **M11 LatentEval** | `latent_eval.py` | t-SNE 圖、FID/MMD/Wasserstein、KMeans metrics | numpy, sklearn, matplotlib | ✓ |
-| **M12 Artifacts** | `artifacts.py` | 寫 pkl/csv/png/json；不承載業務邏輯 | pickle, pandas | ✓ |
-| **M13 ExportPipeline** | `export_pipeline.py` | 編排 M9–M12；組 metadata 表 | M9–M12, M6 | △ |
-| **M14 Summary** | `summary.py` | 跨 fold 彙整 metrics / latent metrics | pandas | ✓ |
-| **M15 Orchestrator** | `orchestrator.py` | `ExperimentRunner.run()` 主迴圈 | M1–M14 | △ |
-| **L0 Legacy** | `trainer/model/utils` | 原版訓練與模型 | — | 既有 |
+```text
+ssda_multilabel/
+  __init__.py
+  config.py
+  seed.py
+  io.py
+  schemas.py
+  validators.py
+  data_preparation.py
+  drug_index.py
+  response_matrix.py
+  target_nshot.py
+  source_split.py
+  cancer_type.py
+  datasets.py
+  dataloaders.py
+  model.py
+  encoder_adapter.py
+  heads.py
+  losses.py
+  adaptation.py
+  trainer.py
+  train_state.py
+  prediction.py
+  metrics.py
+  latent.py
+  latent_eval.py
+  visualization.py
+  artifacts.py
+  reports.py
 
-### 3.2 模組依賴圖（允許方向）
-
-```mermaid
-flowchart LR
-    subgraph L0[L0 Legacy]
-        trainer[trainer.py]
-        model[model.py]
-        utils[utils.py]
-    end
-
-    subgraph infra[Infrastructure]
-        config[config]
-        seed[seed]
-        paths[paths]
-    end
-
-    subgraph pure[Pure Domain - no torch]
-        split[split]
-        cancer[cancer_type]
-        latent_eval[latent_eval]
-        summary[summary]
-        artifacts[artifacts]
-    end
-
-    subgraph torch_domain[Torch Domain]
-        data_load[data_loading]
-        dl_factory[dataloader_factory]
-        train_adapt[training_adapter]
-        latent[latent]
-        prediction[prediction]
-    end
-
-    orchestrator[orchestrator]
-    export_pipe[export_pipeline]
-
-    orchestrator --> config
-    orchestrator --> seed
-    orchestrator --> paths
-    orchestrator --> data_load
-    orchestrator --> split
-    orchestrator --> cancer
-    orchestrator --> dl_factory
-    orchestrator --> train_adapt
-    orchestrator --> export_pipe
-    orchestrator --> summary
-    orchestrator --> artifacts
-
-    export_pipe --> latent
-    export_pipe --> prediction
-    export_pipe --> latent_eval
-    export_pipe --> cancer
-    export_pipe --> artifacts
-
-    dl_factory --> utils
-    train_adapt --> trainer
-    train_adapt --> model
-    latent --> model
-    prediction --> model
+experiment_multilabel_ssda.py
+docs/
+  proposal.md
+  design.md
 ```
 
-**禁止的依賴（耦合反模式）**：
+### 3.1 Why a New Package?
 
-- `split` / `cancer_type` / `latent_eval` **不得** import `trainer` 或 `model`
-- `trainer` **不得** import `ssda_latent`（單向依賴）
-- `latent_eval` **不得** import `torch`（僅吃 numpy 矩陣或 dict）
+使用 `ssda_multilabel/` 而不是直接大量改動 `ssda_latent/` 的原因：
+
+1. 保留目前 SSDA-SingleModel 的 single-drug pipeline。
+2. 避免 multi-label logic 汙染既有 single-drug modules。
+3. 讓新模組可以被獨立測試。
+4. 保持 backward compatibility。
+5. 後續如果要移除 single-drug pipeline，也能逐步遷移。
 
 ---
 
-## 4. 核心資料契約（Contracts）
+## 4. Module Responsibilities
 
-模組間以 **不可變資料結構** 傳遞，避免共享可變 DataFrame 造成 fold 間污染。
+## 4.1 `config.py`
 
-### 4.1 `ExperimentConfig`（M1）
+### Responsibility
 
-```python
-@dataclass(frozen=True)
-class ExperimentConfig:
-    drug: str
-    gene: str                    # e.g. "_tp4k"
-    n_shot: int                  # args.n
-    random_seed: int
-    source_test_size: float
-    n_splits: int
-    encoder: str                 # "DAE" | "MLP"
-    method: str
-    epochs: int
-    lr: float
-    batch_size: int
-    dropout: float
-    encoder_h_dims: tuple[int, ...]
-    predictor_h_dims: tuple[int, ...]
-    device: str
-    latent_output_dir: str
-    # optional cancer type
-    source_cancer_type_path: str | None
-    target_cancer_type_path: str | None
-    sample_id_col: str
-    cancer_type_col: str
-    # behavior flags (see AD-02 ~ AD-05)
-    stratify_source: bool
-    missing_cancer_type_policy: Literal["unknown", "exclude"]
-    save_legacy_outputs: bool
-    run_cancer_eval: bool
-```
+集中管理 CLI 參數與 runtime config。
 
-### 4.2 `ExpressionTables`（M4 輸出）
+### Input
 
-```python
-@dataclass(frozen=True)
-class ExpressionTables:
-    x_source: pd.DataFrame       # index=sample_id, columns=gene
-    y_source: pd.DataFrame       # columns: response, [logIC50]
-    x_target: pd.DataFrame
-    y_target: pd.DataFrame
-```
+CLI arguments.
 
-### 4.3 `SplitManifest`（M5 輸出）
+### Output
 
-```python
-@dataclass(frozen=True)
-class SampleSplit:
-    sample_id: str
-    domain: Literal["source", "target"]
-    response_label: int
-    # exactly one of:
-    source_split: str | None     # source_test | source_fold_train | source_fold_val
-    target_role: str | None      # target_labeled_train | ... | target_test
-    fold_index: int | None       # source fold train/val only
+`MultiLabelConfig` dataclass.
 
-@dataclass(frozen=True)
-class FoldIndices:
-    fold_index: int
-    train_ids: frozenset[str]
-    val_ids: frozenset[str]
-
-@dataclass(frozen=True)
-class SplitManifest:
-    source_test_ids: frozenset[str]
-    folds: tuple[FoldIndices, ...]           # len = n_splits
-    target_assignments: dict[str, str]       # sample_id -> target_role
-    all_samples: tuple[SampleSplit, ...]     # 扁平化，供 export 標註
-```
-
-**切分順序（與 proposal 一致）**：
-
-1. `source_full` → stratified `source_test` + `source_train_val`（若 AD-02 確認 stratify）
-2. `source_train_val` → `StratifiedKFold` → `folds`
-3. `target_full` → 80/20 train/val（`random_seed`）
-4. train/val 各自 n-shot → labeled / unlabeled roles
-5. `target_test` = all target − `target_labeled_train` ids
-
-### 4.4 `CancerTypeRegistry`（M6 輸出）
-
-```python
-@dataclass(frozen=True)
-class CancerTypeAlignmentReport:
-    domain: str
-    total_expression_samples: int
-    matched_samples: int
-    missing_in_metadata: int
-    extra_in_metadata: int
-    unknown_samples: int
-    excluded_samples: int
-
-@dataclass(frozen=True)
-class CancerTypeRegistry:
-    source_map: dict[str, str]   # sample_id -> cancer_type | "Unknown"
-    target_map: dict[str, str]
-    reports: tuple[CancerTypeAlignmentReport, ...]
-    is_available: bool
-```
-
-### 4.5 `TrainingResult`（M8 輸出）
-
-```python
-@dataclass(frozen=True)
-class TrainingResult:
-    fold_index: int
-    encoder: nn.Module           # eval mode, last epoch
-    predictor: nn.Module
-    adentropy_p: nn.Module
-    checkpoint_path: str
-    train_log_path: str | None   # legacy _train_AUCs_.txt
-```
-
-### 4.6 `ExportBundle`（M13 輸出，寫入前記憶體表示）
+### Key Fields
 
 ```python
 @dataclass
-class ExportBundle:
-    source_latent: dict[str, list[float]]
-    target_latent: dict[str, list[float]]
-    source_predictions: pd.DataFrame
-    target_predictions: pd.DataFrame
-    source_val_metrics: dict[str, float]
-    source_test_metrics: dict[str, float]
-    target_metrics: dict[str, float]
-    latent_distribution_metrics: dict[str, float]
-    kmeans_metrics: dict[str, float] | None
-    tsne_domain_png: bytes | None      # 或 Path，由 ArtifactWriter 決定
-    tsne_cancer_png: bytes | None
+class MultiLabelConfig:
+    task_type: Literal["classification", "regression"]
+
+    source_omics_path: str
+    target_omics_path: str
+    source_response_path: str
+    target_response_path: str
+
+    sample_id_col: str
+    drug_id_col: str
+    response_col: str
+
+    source_cancer_type_path: Optional[str]
+    target_cancer_type_path: Optional[str]
+    cancer_type_col: str
+
+    random_seed: int
+    source_test_size: float
+    n_splits: int
+    n_shot: int
+
+    encoder: str
+    encoder_h_dims: str
+    batch_size: int
+    epochs: int
+    lr: float
+
+    reg_loss: Literal["mse", "mae", "huber"]
+    lambda_adapt: float
+
+    output_dir: str
 ```
+
+### Design Notes
+
+`config.py` 不應讀取資料，也不應建立模型。它只負責解析與保存設定。
+
+### Unit Tests
+
+1. CLI default values are valid.
+2. invalid `task_type` raises error.
+3. config can be serialized to `config.json`.
 
 ---
 
-## 5. 模組詳細設計
+## 4.2 `seed.py`
 
-### 5.1 M5 `split.py` — 資料切分
+### Responsibility
 
-**公開 API**：
+集中設定所有 random seed。
+
+### Functions
 
 ```python
-def build_split_manifest(
-    tables: ExpressionTables,
-    config: ExperimentConfig,
-) -> SplitManifest: ...
-
-def manifest_to_source_split_df(manifest: SplitManifest, fold_index: int) -> pd.DataFrame: ...
-def manifest_to_target_split_df(manifest: SplitManifest) -> pd.DataFrame: ...
+def set_global_seed(seed: int) -> None:
+    ...
 ```
 
-**設計要點**：
+### Should Control
 
-- 僅依賴 `pandas` + `sklearn.model_selection`
-- `random.seed(config.random_seed)` 用於 target n-shot 抽樣
-- 驗證：labeled 每 class 數量 = `n_shot`；集合互斥；test 不進 train
+1. Python `random`
+2. NumPy
+3. PyTorch CPU
+4. PyTorch CUDA
+5. DataLoader generator
+6. sklearn split random state
+7. t-SNE random state
+8. KMeans random state
 
-**單元測試**：固定小 DataFrame + seed → 快照比對 split CSV hash。
+### Unit Tests
+
+1. same seed produces same NumPy random sequence.
+2. same seed produces same torch random tensor.
 
 ---
 
-### 5.2 M6 `cancer_type.py` — Cancer type 對齊
+## 4.3 `schemas.py`
 
-**公開 API**：
+### Responsibility
 
-```python
-def load_cancer_type_table(path: str, sample_id_col: str, cancer_type_col: str,
-                           normalizer: SampleIdNormalizer) -> pd.DataFrame: ...
+定義系統內部資料結構，避免各模組傳遞鬆散 dict。
 
-def build_registry(
-    tables: ExpressionTables,
-    config: ExperimentConfig,
-) -> CancerTypeRegistry: ...
-```
-
-**`SampleIdNormalizer` 策略介面**（策略模式，低耦合）：
+### Core Dataclasses
 
 ```python
-class SampleIdNormalizer(Protocol):
-    def normalize(self, sample_id: str, domain: str) -> str: ...
+@dataclass
+class OmicsTable:
+    x: pd.DataFrame
+    sample_ids: list[str]
+    feature_names: list[str]
+    domain: Literal["source", "target"]
 
-class DefaultNormalizer: ...      # str.strip()
-class TCGAPatientNormalizer: ...  # TCGA-XX-XXXX（可選，AD-06）
+@dataclass
+class DrugIndex:
+    drug_ids: list[str]
+    drug_to_index: dict[str, int]
+    index_to_drug: dict[int, str]
+
+@dataclass
+class ResponseMatrix:
+    y: np.ndarray
+    mask: np.ndarray
+    sample_ids: list[str]
+    drug_index: DrugIndex
+    domain: Literal["source", "target"]
+
+@dataclass
+class TargetMasks:
+    observed_mask: np.ndarray
+    labeled_mask: np.ndarray
+    unlabeled_mask: np.ndarray
+
+@dataclass
+class SourceFold:
+    fold_id: int
+    train_sample_ids: list[str]
+    val_sample_ids: list[str]
+    test_sample_ids: list[str]
+
+@dataclass
+class PreparedData:
+    source_omics: OmicsTable
+    target_omics: OmicsTable
+    source_response: ResponseMatrix
+    target_response: ResponseMatrix
+    target_masks: TargetMasks
+    drug_index: DrugIndex
+    folds: list[SourceFold]
+    cancer_type_table: Optional[pd.DataFrame]
 ```
 
-**缺失策略**（對應 proposal Q8）：
+### Design Notes
 
-| policy | prediction/latent metadata | t-SNE / KMeans |
-|---|---|---|
-| `unknown` | 填 `Unknown` | 保留點 |
-| `exclude` | 填 `Unknown` 或空 | 排除該 sample |
+所有 downstream modules 都應使用 dataclass，不直接重新解析 CSV。
+
+### Unit Tests
+
+1. dataclass objects preserve shape consistency.
+2. `ResponseMatrix.y.shape == ResponseMatrix.mask.shape`.
+3. drug index length equals matrix column count.
 
 ---
 
-### 5.3 M7 `dataloader_factory.py` — DataLoader 適配器
+## 4.4 `io.py`
 
-**職責**：將 `SplitManifest` 的 index 子集轉為原版 `dataloader_source` / `dataloader_labeled_target` / `dataloader_unlabeled_target` 結構。
+### Responsibility
+
+低階檔案讀取與寫入，不做業務邏輯。
+
+### Functions
 
 ```python
-@dataclass(frozen=True)
-class FoldDataLoaders:
-    source: dict[str, DataLoader]       # keys: train, val
-    target_labeled: dict[str, DataLoader]
-    target_unlabeled: dict[str, DataLoader]
+def read_csv(path: str) -> pd.DataFrame:
+    ...
 
-def build_fold_dataloaders(
-    tables: ExpressionTables,
-    manifest: SplitManifest,
-    fold_index: int,
-    config: ExperimentConfig,
-) -> FoldDataLoaders: ...
+def write_csv(df: pd.DataFrame, path: str) -> None:
+    ...
+
+def write_pickle(obj: Any, path: str) -> None:
+    ...
+
+def read_pickle(path: str) -> Any:
+    ...
+
+def ensure_dir(path: str) -> None:
+    ...
 ```
 
-**與原版對齊**：
+### Design Notes
 
-- source train：`WeightedRandomSampler`（從 `experiment_shot.py` 搬移，不修改 `utils.py`）
-- batch_size / shuffle 與原版一致
-- target labeled/unlabeled 的 train/val phase 各自對應原版兩個 DataLoader
+此模組不應知道 source / target / drug / model 的概念。
+
+### Unit Tests
+
+1. creates missing output directory.
+2. writes and reads pickle correctly.
+3. fails clearly on missing file.
 
 ---
 
-### 5.4 M8 `training_adapter.py` — 訓練適配
+## 4.5 `validators.py`
 
-**職責**：封裝 `experiment_shot.py` 中的模型建構與 `trainer.train_semi_*` 呼叫，**不改 loss**。
+### Responsibility
+
+集中資料格式檢查與錯誤訊息。
+
+### Functions
 
 ```python
-def build_models(config: ExperimentConfig, device: torch.device) -> ModelBundle: ...
+def validate_omics_table(df: pd.DataFrame, sample_id_col: str) -> None:
+    ...
 
-def train_fold(
-    models: ModelBundle,
-    loaders: FoldDataLoaders,
-    config: ExperimentConfig,
-    fold_index: int,
-    legacy_auc_path: str | None,
-) -> TrainingResult: ...
+def validate_response_long_table(
+    df: pd.DataFrame,
+    sample_id_col: str,
+    drug_id_col: str,
+    response_col: str,
+    task_type: str,
+    domain: str,
+) -> None:
+    ...
+
+def validate_drug_index(drug_index: DrugIndex) -> None:
+    ...
+
+def validate_matrix_and_mask(y: np.ndarray, mask: np.ndarray) -> None:
+    ...
 ```
 
-**Checkpoint 策略**（對應 proposal Q17–Q18）：
+### Checks
 
-| 策略 | 行為 |
+1. Required columns exist.
+2. No duplicate sample ID in omics table.
+3. Omics features are numeric.
+4. response values are numeric.
+5. classification labels are 0/1.
+6. target labels are 0/1.
+7. drug IDs are not empty.
+8. matrix and mask shapes match.
+9. mask contains only 0/1.
+
+### Unit Tests
+
+1. missing required column raises error.
+2. non-binary target response raises error.
+3. duplicate sample IDs raise error.
+4. non-numeric omics feature raises error.
+
+---
+
+## 4.6 `drug_index.py`
+
+### Responsibility
+
+建立與保存全局 drug order。
+
+### Input
+
+source response long table, target response long table.
+
+### Output
+
+`DrugIndex` and `drug_list.csv`.
+
+### Functions
+
+```python
+def build_drug_index_from_union(
+    source_response: pd.DataFrame,
+    target_response: pd.DataFrame,
+    drug_id_col: str,
+) -> DrugIndex:
+    ...
+
+def save_drug_list(drug_index: DrugIndex, path: str) -> None:
+    ...
+
+def load_drug_list(path: str) -> DrugIndex:
+    ...
+```
+
+### Required Behavior
+
+```text
+drug_list = sorted(unique(source_drugs ∪ target_drugs))
+```
+
+不刪除任何 drug。
+
+### Edge Cases
+
+| Case | Behavior |
 |---|---|
-| **預設 `last_epoch`** | 與原版一致；`model_final.pth` = 最後 epoch state_dict |
-| **可選 `best_val`**（AD-03） | 若啟用，需在 adapter 內複製 best 追蹤邏輯（不修改 trainer 內部） |
+| source-only drug | keep |
+| target-only drug | keep |
+| duplicated drug rows | allowed in long table |
+| empty drug ID | error |
+| no overlapping drugs | allowed but warning |
 
-**建議實作 best_val（若採用）**：在 `training_adapter` 外包一層 epoch callback，或 fork `train_semi_*` 為 `train_semi_*_with_return_best`（僅在 AD-03 確認後）。
+### Unit Tests
+
+1. source-only drug is retained.
+2. target-only drug is retained.
+3. drug order is deterministic.
+4. saved and loaded drug index are identical.
 
 ---
 
-### 5.5 M9 `latent.py` — Latent 抽取
+## 4.7 `data_preparation.py`
+
+### Responsibility
+
+高階資料整理 orchestration。
+
+### Input
+
+`MultiLabelConfig`
+
+### Output
+
+`PreparedData`
+
+### Main Function
 
 ```python
-def get_encoder_latent(encoder: nn.Module, x: Tensor) -> Tensor: ...
-
-def encode_latent_dict(
-    encoder: nn.Module,
-    x_df: pd.DataFrame,
-    device: torch.device,
-    batch_size: int,
-) -> dict[str, list[float]]: ...
+def prepare_multilabel_data(config: MultiLabelConfig) -> PreparedData:
+    ...
 ```
 
-**DAE 行為**（proposal Q19 / AD-04）：
+### Internal Steps
 
-- **預設**：`encoder(x)` → `[0]`（含 denoising，與 `Test_Double_Model` 一致）
-- **可選模式**：`encoder.ae.encode(x)`（無 denoising），由 `config.latent_mode` 切換
+1. Read source / target omics tables.
+2. Validate omics tables.
+3. Align source / target omics features.
+4. Read source / target response long tables.
+5. Validate response long tables.
+6. Build `DrugIndex` from source ∪ target drugs.
+7. Build source response matrix + mask.
+8. Build target response matrix + observed mask.
+9. Build target n-shot labeled / unlabeled masks.
+10. Build source test split and K-fold split.
+11. Load and align cancer type metadata.
+12. Write alignment reports.
 
-**效能**：`torch.no_grad()` + `encoder.eval()`；按 batch 迭代 sample×gene DataFrame。
+### Design Notes
+
+`data_preparation.py` 可呼叫其他 data modules，但 downstream trainer 不應重新處理 long table。
+
+### Unit Tests
+
+1. full preparation creates all expected dataclass objects.
+2. source / target matrix columns follow same drug order.
+3. source and target omics features are aligned.
 
 ---
 
-### 5.6 M10 `prediction.py` — 推論與 metrics
+## 4.8 `response_matrix.py`
+
+### Responsibility
+
+將 long response table 轉換為 wide matrix + mask。
+
+### Functions
 
 ```python
-def predict_dataframe(
-    model: Test_Double_Model,
-    x_df: pd.DataFrame,
-    device: torch.device,
-    batch_size: int,
+def long_to_response_matrix(
+    response_df: pd.DataFrame,
+    sample_ids: list[str],
+    drug_index: DrugIndex,
+    sample_id_col: str,
+    drug_id_col: str,
+    response_col: str,
+    domain: str,
+) -> ResponseMatrix:
+    ...
+```
+
+### Behavior
+
+For each observed `(sample_id, drug_id, response)`:
+
+```text
+Y[sample_index, drug_index] = response
+mask[sample_index, drug_index] = 1
+```
+
+For missing positions:
+
+```text
+Y = 0
+mask = 0
+```
+
+### Duplicate Handling
+
+If duplicate `(sample_id, drug_id)` rows exist, do not guess. The implementation should support a configurable strategy:
+
+```text
+--duplicate_response_strategy error | mean | median | first
+```
+
+Default recommendation:
+
+```text
+error
+```
+
+because duplicate labels may indicate upstream data issues.
+
+### Unit Tests
+
+1. converts long table to correct wide shape.
+2. missing labels have mask 0.
+3. source-only and target-only drugs create correct zero masks.
+4. duplicate rows raise error by default.
+
+---
+
+## 4.9 `target_nshot.py`
+
+### Responsibility
+
+建立 target position-level n-shot masks。
+
+### Input
+
+`Y_target`, `mask_target_observed`, `n_shot`, `random_seed`.
+
+### Output
+
+`TargetMasks`
+
+### Functions
+
+```python
+def build_target_nshot_masks(
+    y_target: np.ndarray,
+    observed_mask: np.ndarray,
+    n_shot: int,
+    seed: int,
+) -> TargetMasks:
+    ...
+```
+
+### Algorithm
+
+For each drug column:
+
+```text
+if observed_mask[:, d].sum() == 0:
+    skip this drug
+
+class_0_positions = positions where observed_mask[:, d] == 1 and y_target[:, d] == 0
+class_1_positions = positions where observed_mask[:, d] == 1 and y_target[:, d] == 1
+
+sample up to n_shot from class_0_positions
+sample up to n_shot from class_1_positions
+
+set selected positions in labeled_mask = 1
+```
+
+Then:
+
+```text
+unlabeled_mask = observed_mask - labeled_mask
+```
+
+### Edge Cases
+
+| Case | Behavior |
+|---|---|
+| target has no label for a drug | skip and log warning |
+| class 0 count < n_shot | sample all available and log warning |
+| class 1 count < n_shot | sample all available and log warning |
+| class absent | skip that class and log warning |
+| same sample selected for different drugs | allowed |
+| labeled and unlabeled overlap | must never happen |
+
+### Unit Tests
+
+1. each drug gets up to n class 0 and n class 1 positions.
+2. drug with no target label is skipped.
+3. insufficient class samples do not crash.
+4. labeled + unlabeled equals observed.
+5. labeled and unlabeled masks are disjoint.
+6. same seed produces same mask.
+
+---
+
+## 4.10 `source_split.py`
+
+### Responsibility
+
+建立 source sample-level test split 與 K-fold split。
+
+### Functions
+
+```python
+def split_source_samples(
+    sample_ids: list[str],
+    y_source: np.ndarray,
+    mask_source: np.ndarray,
+    test_size: float,
+    n_splits: int,
+    seed: int,
+) -> list[SourceFold]:
+    ...
+```
+
+### Split Policy
+
+1. Split is sample-level.
+2. `source_test` is created first.
+3. Remaining samples are split into K folds.
+4. No sample appears in both train and validation in the same fold.
+5. No test sample appears in any train / validation.
+
+### Stratification
+
+Multi-label stratification can be non-trivial.
+
+Recommended policy:
+
+1. If a stable multi-label stratification implementation is available, use it.
+2. Otherwise, use sample-level random split and report per-drug label distribution.
+3. Do not perform sample-drug pair split.
+
+### Reports
+
+Output:
+
+```text
+source_split.csv
+source_split_label_distribution.csv
+```
+
+### Unit Tests
+
+1. train / val / test are disjoint.
+2. all source samples are assigned.
+3. fixed seed gives reproducible split.
+4. every fold has non-empty train and val.
+
+---
+
+## 4.11 `cancer_type.py`
+
+### Responsibility
+
+Load and align cancer type metadata.
+
+### Functions
+
+```python
+def load_cancer_type_table(path: Optional[str]) -> Optional[pd.DataFrame]:
+    ...
+
+def align_cancer_type(
+    source_sample_ids: list[str],
+    target_sample_ids: list[str],
+    source_cancer_df: Optional[pd.DataFrame],
+    target_cancer_df: Optional[pd.DataFrame],
 ) -> pd.DataFrame:
-    """Columns: sample_id, pred_label, probability_class_0, probability_class_1, confidence"""
-
-def compute_binary_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
-    """AUC, AUPR, accuracy, f1, balanced_accuracy — 复用 utils.roc_auc_score_trainval"""
+    ...
 ```
 
-**合併標註**：
+### Output Format
 
-```python
-def build_prediction_table(
-    pred_df: pd.DataFrame,
-    manifest: SplitManifest,
-    registry: CancerTypeRegistry | None,
-    config: ExperimentConfig,
-    fold_index: int,
-    domain: Literal["source", "target"],
-) -> pd.DataFrame: ...
-```
-
-**Metrics 範圍**（proposal Q5）：
-
-- `source_val_metrics`：`source_fold_val` ids
-- `source_test_metrics`：`source_test` ids
-- `target_prediction_metrics`：預設 **all target**（可配置 AD-07）
-
----
-
-### 5.7 M11 `latent_eval.py` — 分布與聚類評估
-
-**純 numpy/sklearn**，輸入為 `LatentDict` 或 `np.ndarray` + labels。
-
-```python
-def compute_distribution_metrics(
-    source_latent: np.ndarray,
-    target_latent: np.ndarray,
-) -> dict[str, float]:  # fid, mmd, wasserstein
-
-def compute_kmeans_cancer_metrics(
-    latent: np.ndarray,
-    cancer_types: np.ndarray,
-    k: int,
-    random_state: int,
-) -> dict[str, float]: ...
-
-def plot_tsne_domain(...) -> matplotlib.figure.Figure: ...
-def plot_tsne_cancer(...) -> matplotlib.figure.Figure: ...
-```
-
-**FID/MMD/Wasserstein 實作來源**（AD-08）：
-
-| 方案 | 優點 | 缺點 |
+| sample_id | domain | cancer_type |
 |---|---|---|
-| A. vendor 複製 DAPL `tools.latent_metrics` | 與 DAPL 數值一致 | 需維護副本 |
-| B. `sys.path` 引用 DAPL-master | 無重複程式 | 路徑耦合、CI 需 DAPL |
-| **C. 本 repo 自實作（預設）** | 零外部 repo 依賴 | 需與 DAPL 對齊驗證 |
 
-**預設**：方案 C，並在 `tests/test_latent_eval.py` 以固定小矩陣做 regression snapshot。
+### Missing Policy
 
----
+Default:
 
-### 5.8 M12 `artifacts.py` — 統一寫檔
-
-```python
-@dataclass(frozen=True)
-class RunLayout:
-    run_dir: Path              # .../latent_ssda/{drug}/seed_{seed}/
-    fold_dir: Callable[[int], Path]
-
-class ArtifactWriter:
-    def write_config(self, config: ExperimentConfig, extra: dict) -> None: ...
-    def write_split_tables(self, manifest: SplitManifest) -> None: ...
-    def write_cancer_summary(self, registry: CancerTypeRegistry) -> None: ...
-    def write_fold_bundle(self, fold_index: int, bundle: ExportBundle, models: TrainingResult) -> None: ...
-    def write_summaries(self, summary_dfs: dict[str, pd.DataFrame]) -> None: ...
+```text
+Unknown
 ```
 
-**效益**：路徑規則只在一處修改；Export 模組不直接 `open()` 檔案。
+Configurable:
+
+```text
+--unknown_cancer_type_policy unknown | exclude
+```
+
+### Unit Tests
+
+1. missing metadata becomes Unknown.
+2. extra metadata rows are reported.
+3. source and target domains are preserved.
 
 ---
 
-### 5.9 M13 `export_pipeline.py` — Fold 級匯出編排
+## 4.12 `datasets.py`
+
+### Responsibility
+
+Define PyTorch dataset objects.
+
+### Dataset Types
 
 ```python
-class ExportPipeline:
-    def __init__(self, config: ExperimentConfig, registry: CancerTypeRegistry | None, writer: ArtifactWriter): ...
+class MultiLabelSampleDataset(Dataset):
+    ...
+```
 
-    def run(
+### Return Value
+
+Each item should contain:
+
+```python
+{
+    "x": torch.FloatTensor[n_features],
+    "y": torch.FloatTensor[n_drugs],
+    "mask": torch.FloatTensor[n_drugs],
+    "sample_id": str,
+}
+```
+
+For target data, dataset may also return:
+
+```python
+{
+    "observed_mask": ...,
+    "labeled_mask": ...,
+    "unlabeled_mask": ...,
+}
+```
+
+### Design Notes
+
+The dataset should not decide loss type. It only provides tensors.
+
+### Unit Tests
+
+1. `__len__` equals number of samples.
+2. `__getitem__` returns correct shapes.
+3. masks are float tensors.
+4. sample IDs are preserved.
+
+---
+
+## 4.13 `dataloaders.py`
+
+### Responsibility
+
+Build DataLoaders from datasets.
+
+### Functions
+
+```python
+def build_source_loader(...):
+    ...
+
+def build_target_loader(...):
+    ...
+
+def build_eval_loader(...):
+    ...
+```
+
+### Design Notes
+
+1. Training loaders may shuffle.
+2. Evaluation loaders must not shuffle.
+3. DataLoader random generator should use config seed.
+4. Avoid using legacy single-drug weighted sampler unless adapted for multi-label.
+
+### Unit Tests
+
+1. train loader can iterate.
+2. eval loader preserves sample order.
+3. batch tensors have expected shapes.
+
+---
+
+## 4.14 `encoder_adapter.py`
+
+### Responsibility
+
+Provide a stable interface to original SSDA encoders.
+
+### Functions
+
+```python
+def get_encoder_latent(encoder: nn.Module, x: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+    ...
+```
+
+### DAE Handling
+
+If DAE forward uses random denoising, deterministic latent extraction should call:
+
+```python
+encoder.ae.encode(x)
+```
+
+or another deterministic encoder path.
+
+### MLP Handling
+
+If MLP directly returns latent:
+
+```python
+latent = encoder(x)
+```
+
+### Unit Tests
+
+1. DAE latent shape is `[batch, latent_dim]`.
+2. MLP latent shape is `[batch, latent_dim]`.
+3. deterministic DAE latent is identical across repeated calls.
+
+---
+
+## 4.15 `heads.py`
+
+### Responsibility
+
+Define multi-output prediction head.
+
+### Class
+
+```python
+class MultiOutputHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dims: list[int], n_drugs: int):
+        ...
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        ...
+```
+
+### Output
+
+```text
+[batch_size, n_drugs]
+```
+
+### Design Notes
+
+No task-specific activation inside the head.
+
+1. Classification uses raw logits.
+2. Regression uses raw continuous scores.
+3. Target BCE also uses raw logits.
+
+### Unit Tests
+
+1. output shape equals `[batch_size, n_drugs]`.
+2. no activation is applied by default.
+
+---
+
+## 4.16 `model.py`
+
+### Responsibility
+
+Compose encoder + multi-output head.
+
+### Class
+
+```python
+class MultiLabelSSDAModel(nn.Module):
+    def __init__(self, encoder: nn.Module, head: MultiOutputHead):
+        ...
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        ...
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        ...
+```
+
+### Design Notes
+
+This wrapper should replace legacy `Test_Double_Model` in the multi-label pipeline.
+
+### Unit Tests
+
+1. forward output shape is `[batch, n_drugs]`.
+2. encode output shape is `[batch, latent_dim]`.
+
+---
+
+## 4.17 `losses.py`
+
+### Responsibility
+
+Implement task-specific masked supervised losses.
+
+### Functions
+
+```python
+def masked_bce_with_logits(
+    logits: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    ...
+
+def masked_mse(
+    pred: torch.Tensor,
+    y: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    ...
+
+def masked_mae(...):
+    ...
+
+def masked_huber(...):
+    ...
+```
+
+### Safety Rule
+
+If `mask.sum() == 0`, return zero loss with gradient support, or skip the loss in trainer.
+
+Recommended helper:
+
+```python
+def safe_masked_mean(raw_loss, mask):
+    denom = mask.sum().clamp_min(1.0)
+    return (raw_loss * mask).sum() / denom
+```
+
+### Unit Tests
+
+1. masked positions do not contribute.
+2. all-zero mask does not crash.
+3. BCE loss matches PyTorch BCE on valid positions.
+4. MSE loss matches manual MSE on valid positions.
+
+---
+
+## 4.18 `adaptation.py`
+
+### Responsibility
+
+Implement target unlabeled entropy / adentropy losses for multi-output predictions.
+
+### Functions
+
+```python
+def masked_entropy_loss(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    ...
+
+def masked_adentropy_loss(
+    logits: torch.Tensor,
+    mask: torch.Tensor,
+    eta: float,
+) -> torch.Tensor:
+    ...
+```
+
+### Multi-label Interpretation
+
+For binary multi-label outputs, use sigmoid probability per drug:
+
+```python
+p = sigmoid(logits)
+entropy = -p * log(p) - (1 - p) * log(1 - p)
+```
+
+Then apply:
+
+```text
+entropy * target_unlabeled_mask
+```
+
+### Unit Tests
+
+1. entropy shape matches logits.
+2. mask excludes missing positions.
+3. all-zero mask does not crash.
+4. loss is finite.
+
+---
+
+## 4.19 `trainer.py`
+
+### Responsibility
+
+Run training and validation loops.
+
+### Main Class
+
+```python
+class MultiLabelSSDTrainer:
+    def __init__(
         self,
-        fold_index: int,
-        training: TrainingResult,
-        tables: ExpressionTables,
-        manifest: SplitManifest,
-    ) -> ExportBundle:
-        # 1. encode all source / all target latent
-        # 2. predict all source / all target
-        # 3. metrics on val/test/target subsets
-        # 4. latent_eval (domain tsne always; cancer tsne if registry.is_available)
-        # 5. delegate to ArtifactWriter
+        model: MultiLabelSSDAModel,
+        optimizer: torch.optim.Optimizer,
+        config: MultiLabelConfig,
+    ):
+        ...
+
+    def train_fold(
+        self,
+        fold: SourceFold,
+        prepared_data: PreparedData,
+    ) -> TrainResult:
+        ...
 ```
+
+### Training Losses
+
+#### Classification Run
+
+```text
+loss_total =
+    source_masked_bce
+  + target_labeled_masked_bce
+  + lambda_adapt * target_unlabeled_adaptation
+  + optional_reconstruction_loss
+```
+
+#### Regression Run
+
+```text
+loss_total =
+    source_masked_regression_loss
+  + target_labeled_masked_bce
+  + lambda_adapt * target_unlabeled_adaptation
+  + optional_reconstruction_loss
+```
+
+### Critical Rule
+
+Validation must never call:
+
+```python
+loss.backward()
+optimizer.step()
+```
+
+### Training Batch Strategy
+
+There are two possible approaches:
+
+#### Approach A: paired source and target batches
+
+Each training step draws one source batch and one target batch.
+
+Pros:
+
+1. Close to original SSDA.
+2. Source and target losses updated together.
+
+Cons:
+
+1. Source and target loader lengths may differ.
+
+#### Approach B: separate source and target steps
+
+Each epoch has source supervised pass and target adaptation pass.
+
+Pros:
+
+1. Simpler masks.
+2. Easier debug.
+
+Cons:
+
+1. Less close to original SSDA.
+
+### Design Decision
+
+Use **Approach A** by default to preserve original SSDA spirit.
+
+If loaders have different lengths, cycle the shorter loader.
+
+### Unit Tests
+
+1. one training step updates parameters.
+2. validation step does not update parameters.
+3. classification run computes all required losses.
+4. regression run computes source regression + target BCE.
+5. target unlabeled loss uses `target_unlabeled_mask`.
 
 ---
 
-### 5.10 M14 `summary.py` — 跨 fold 彙整
+## 4.20 `train_state.py`
+
+### Responsibility
+
+Define training result containers.
+
+### Dataclasses
 
 ```python
-def aggregate_fold_metrics(fold_dirs: list[Path]) -> pd.DataFrame: ...
-def aggregate_latent_metrics(fold_dirs: list[Path]) -> pd.DataFrame: ...
-def aggregate_kmeans_metrics(fold_dirs: list[Path]) -> pd.DataFrame: ...
+@dataclass
+class EpochLog:
+    epoch: int
+    source_loss: float
+    target_labeled_loss: float
+    target_adapt_loss: float
+    total_loss: float
+    val_loss: float
+
+@dataclass
+class TrainResult:
+    fold_id: int
+    model_path: str
+    epoch_logs: list[EpochLog]
 ```
 
-輸出至 `seed_{seed}/metrics_summary.csv` 等（與 proposal §11 一致）。
+### Unit Tests
+
+1. can convert logs to DataFrame.
+2. can write logs to CSV.
 
 ---
 
-### 5.11 M15 `orchestrator.py` — 主流程
+## 4.21 `prediction.py`
+
+### Responsibility
+
+Generate prediction long tables.
+
+### Functions
 
 ```python
-class ExperimentRunner:
-    def __init__(self, config: ExperimentConfig): ...
+def predict_matrix(
+    model: MultiLabelSSDAModel,
+    x: np.ndarray,
+    batch_size: int,
+    device: str,
+) -> np.ndarray:
+    ...
 
-    def run(self) -> None:
-        SeedManager.set_all(self.config.random_seed)
-        layout = RunLayout.from_config(self.config)
-        writer = ArtifactWriter(layout)
-
-        tables = DataLoadingModule.load(self.config)
-        manifest = build_split_manifest(tables, self.config)
-        registry = build_registry(tables, self.config)  # may be empty/skipped
-
-        writer.write_config(...)
-        writer.write_split_tables(manifest)
-        if registry.is_available:
-            writer.write_cancer_summary(registry)
-
-        fold_results = []
-        for fold in range(self.config.n_splits):
-            loaders = build_fold_dataloaders(tables, manifest, fold, self.config)
-            training = train_fold(..., fold_index=fold)
-            bundle = ExportPipeline(...).run(fold, training, tables, manifest)
-            fold_results.append(layout.fold_dir(fold))
-
-        SummaryAggregator(writer).aggregate(fold_results)
+def build_prediction_long_table(
+    scores: np.ndarray,
+    y: np.ndarray,
+    mask: np.ndarray,
+    sample_ids: list[str],
+    drug_index: DrugIndex,
+    domain: str,
+    split_or_role: np.ndarray,
+    task_type: str,
+) -> pd.DataFrame:
+    ...
 ```
+
+### Output Rule
+
+Export only observed sample-drug positions by default:
+
+```text
+mask == 1
+```
+
+Optional future extension:
+
+```text
+export full matrix prediction
+```
+
+### Classification Output
+
+For classification:
+
+```text
+pred_score = logits
+probability = sigmoid(logit)
+pred_label = probability >= 0.5
+confidence = probability
+```
+
+### Regression Output
+
+For regression:
+
+```text
+pred_score = continuous score
+pred_label = pred_score >= 1.0
+confidence = optional sigmoid(pred_score), or empty
+```
+
+Target evaluation in regression run should still use binary label and binary prediction threshold.
+
+### Unit Tests
+
+1. output table has one row per observed position.
+2. source-only drug predictions export if observed in source.
+3. target-only drug predictions export if observed in target.
+4. probability is present for classification.
+5. prediction table includes drug_id and drug_index.
 
 ---
 
-## 6. 與既有程式碼的整合策略
+## 4.22 `metrics.py`
 
-### 6.1 `experiment_shot.py` 改造方式（AD-01 延伸）
+### Responsibility
 
-**預設方案：薄入口保留檔名**
+Compute prediction metrics.
+
+### Functions
 
 ```python
-# experiment_shot.py（改造後）
-def main(args):
-    config = build_experiment_config(args)
-    ExperimentRunner(config).run()
+def compute_classification_metrics_per_drug(df: pd.DataFrame) -> pd.DataFrame:
+    ...
+
+def compute_classification_metrics_summary(df: pd.DataFrame) -> pd.DataFrame:
+    ...
+
+def compute_regression_metrics_per_drug(df: pd.DataFrame) -> pd.DataFrame:
+    ...
+
+def compute_regression_metrics_summary(df: pd.DataFrame) -> pd.DataFrame:
+    ...
 ```
 
-- 移除 `for i in range(50)`
-- 原版 CLI 參數保留；新增參數在 `config.py` 擴充
-- **不向後提供 50-seed 模式**（除非 AD-09 要求）
+### Classification Metrics
 
-### 6.2 `trainer.py` 變更邊界
+1. AUC
+2. AUPR
+3. Accuracy
+4. F1
+5. Balanced accuracy
 
-| 允許 | 不允許 |
+### Regression Metrics
+
+1. RMSE
+2. MAE
+3. R2
+4. Pearson
+5. Spearman
+
+### Edge Cases
+
+| Case | Behavior |
 |---|---|
-| 新增獨立函式 `predict_logits_batch`（若放在 trainer 會增加耦合，**建議放 M10**） | 修改 `loss_c` / `loss_ae` / `adentropy` 權重 |
-| 從 `training_adapter` 傳入不同 DataLoader | 修改 `Test_Double_Model` |
-| 可選：提取 `train_semi_*` 重複邏輯為內部 helper（非本階段必須） | 讓 trainer import `ssda_latent` |
+| only one class for a drug | AUC/AUPR = NaN with warning |
+| fewer than 2 samples | metric = NaN |
+| no observed rows | empty metrics table |
+| regression constant vector | Pearson/Spearman = NaN |
 
-### 6.3 `utils.create_dataset` 不變契約
+### Unit Tests
+
+1. per-drug metrics group correctly.
+2. micro/macro summaries work.
+3. single-class AUC does not crash.
+4. regression metrics match sklearn/manual calculations.
+
+---
+
+## 4.23 `latent.py`
+
+### Responsibility
+
+Export sample-level latent dictionaries.
+
+### Functions
 
 ```python
-# 輸入：x: gene×sample DataFrame, y: meta with 'response'
-# 輸出：DataLoader(TensorDataset(FloatTensor, LongTensor))
+def encode_latent_dict(
+    model: MultiLabelSSDAModel,
+    x: np.ndarray,
+    sample_ids: list[str],
+    batch_size: int,
+    device: str,
+) -> dict[str, list[float]]:
+    ...
 ```
 
-`dataloader_factory` 負責在呼叫前 `.loc` 子集並 `.T`。
+### Requirements
+
+1. Export after fold training.
+2. Use deterministic encoder path.
+3. Source latent contains all source samples.
+4. Target latent contains all target samples.
+5. Latent is sample-level only.
+
+### Unit Tests
+
+1. dict length equals number of samples.
+2. each vector length equals latent dim.
+3. repeated deterministic export gives same values.
 
 ---
 
-## 7. 輸出物與路徑（對齊 proposal）
+## 4.24 `latent_eval.py`
 
-由 `RunLayout` 集中產生：
+### Responsibility
+
+Compute latent distribution and clustering metrics.
+
+### Functions
 
 ```python
-def fold_dir(self, k: int) -> Path:
-    return self.run_dir / f"fold_{k}"
+def compute_fid(source_z: np.ndarray, target_z: np.ndarray) -> float:
+    ...
 
-def seed_dir(self) -> Path:
-    return Path(self.config.latent_output_dir) / self.config.drug / f"seed_{self.config.random_seed}"
+def compute_mmd(source_z: np.ndarray, target_z: np.ndarray) -> float:
+    ...
+
+def compute_wasserstein(source_z: np.ndarray, target_z: np.ndarray) -> float:
+    ...
+
+def compute_kmeans_cancer_type_metrics(
+    z: np.ndarray,
+    cancer_type: list[str],
+    seed: int,
+) -> dict[str, float]:
+    ...
 ```
 
-檔案清單見 proposal §11；`ArtifactWriter.write_fold_bundle` 維護 **檔名常數表** `ARTIFACT_NAMES` 以避免拼字錯誤。
+### Unit Tests
+
+1. metrics are finite for normal input.
+2. insufficient cancer types returns NaN with warning.
+3. Unknown cancer type policy is respected.
 
 ---
 
-## 8. 錯誤處理與日誌
+## 4.25 `visualization.py`
 
-| 情境 | 行為 |
-|---|---|
-| target 某 class 樣本數 < `n_shot` | 啟動前 `SplitModule.validate()` 拋出明確錯誤 |
-| 未提供 cancer type | `registry.is_available=False`；跳過 cancer t-SNE / KMeans；寫 log |
-| FID 樣本數過少 | 回傳 `nan` 並記錄 warning |
-| CUDA 不可用且 `--device gpu` | 與原版相同 fallback CPU |
-| 輸出目錄已存在 | **AD-10**：預設 `overwrite` 或 `fail`？建議 `overwrite` + 寫入新 config timestamp |
+### Responsibility
 
-**日誌**：每 fold 寫 `fold_k/run.log`（標準 logging 模組），與 stdout 同步。
+Generate t-SNE figures.
 
----
+### Functions
 
-## 9. 測試策略
+```python
+def plot_tsne_domain_mixing(...):
+    ...
 
-### 9.1 單元測試（無 GPU）
-
-| 測試檔 | 對象 | 方法 |
-|---|---|---|
-| `test_split.py` | M5 | 合成 20 source + 10 target；斷言互斥與比例 |
-| `test_cancer_type.py` | M6 | mock CSV；normalizer；missing policy |
-| `test_latent_eval.py` | M11 | 固定矩陣；metrics 有限值 |
-| `test_prediction_metrics.py` | M10 | 完美分類 / 隨機標籤 AUC 邊界 |
-| `test_paths.py` | M3 | 路徑生成 |
-
-### 9.2 整合測試（可選 GPU）
-
-```bash
-python experiment_shot.py --drug Gefitinib --n 3 --epochs 2 --random_seed 42 --n_splits 2
+def plot_tsne_cancer_type(...):
+    ...
 ```
 
-斷言：
+### t-SNE Perplexity
 
-- `fold_0/source_latent_representation.pkl` 樣本數 = source 全體
-- latent 向量長度 128
-- `source_prediction_results.csv` 行數 = source 樣本數
+Use dynamic perplexity to avoid small sample failures:
 
-### 9.3 與原版一致性測試
+```python
+perplexity = min(30, max(2, (n_samples - 1) // 3))
+```
 
-固定 `random_seed=0`、`n_splits=1`（退化成單次 split）、相同 hyperparams：比對 **同一 epoch 數** 下 source val AUC 趨勢是否與舊版同數量級（允許浮點誤差，因 source split 改為 5-fold 後數值不必逐 bit 相同）。
+### Unit Tests
 
----
-
-## 10. 實作順序（對應模組）
-
-| 階段 | 模組 | 交付物 |
-|---|---|---|
-| **P0** | M1, M2, M3, M4, M5, M15(骨架) | 可跑通 fold loop + split CSV |
-| **P1** | M7, M8 | 訓練 + `model_final.pth` |
-| **P2** | M9, M10, M12, M13 | latent pkl + prediction CSV + metrics |
-| **P3** | M6, M11 | cancer 對齊 + t-SNE + FID/KMeans |
-| **P4** | M14 | summary CSV + legacy 輸出（若啟用） |
+1. plot file is created.
+2. small sample size does not crash.
+3. missing cancer type handled.
 
 ---
 
-## 11. 架構層級待確認項（AD）
+## 4.26 `artifacts.py`
 
-以下為 **架構設計專用** 取捨，與 proposal §17 需求問題相互獨立。請回覆編號；未回覆前 **實作採「預設」欄**。
+### Responsibility
 
-| ID | 問題 | 預設 | 影響 |
-|---|---|---|---|
-| **AD-01** | 新程式碼放在 `ssda_latent/` 套件，而非根目錄 `*_utils.py`？ | **是** | 目錄結構、測試配置 |
-| **AD-02** | source test + 5-fold 是否 **stratify**？（proposal Q1–Q2） | **是** | `split.py` 實作 |
-| **AD-03** | 除 `model_final.pth`（last epoch）外，是否另存 **best val** checkpoint？（Q18） | **否** | `training_adapter` 複雜度 |
-| **AD-04** | DAE latent 用 `forward`（denoise）或 `ae.encode`？（Q19） | **forward** | `latent.py` |
-| **AD-05** | 是否保留原版 `save/results/sc/` 與 `save/sc/all_path/`？（Q20） | **是** | `training_adapter` 雙寫路徑 |
-| **AD-06** | `SampleIdNormalizer` 是否內建 TCGA patient key 規則？（Q12） | **可插拔，預設僅 strip** | `cancer_type.py` |
-| **AD-07** | `target_prediction_metrics` 對 **all target** 或僅 **target_test**？（Q5） | **all target** | `export_pipeline` 切片 |
-| **AD-08** | FID/MMD/Wasserstein：**自實作** vs 引用 DAPL？ | **自實作** | `latent_eval.py` |
-| **AD-09** | 是否保留 **50-seed loop** 為可選模式（`--num_seeds 50`）？ | **否** | orchestrator |
-| **AD-10** | 輸出目錄已存在：**overwrite** 或 **fail**？ | **overwrite** | `ArtifactWriter` |
-| **AD-11** | 是否輸出 **CSV 版 latent**（sample × 128）？（Q21） | **否**（僅 pkl） | `artifacts.py` |
-| **AD-12** | KMeans 是否排除 `Unknown`？（Q15） | **排除** | `latent_eval.py` |
-| **AD-13** | 缺失 cancer type：**Unknown** 或 **exclude**？（Q8） | **Unknown** | `cancer_type.py` |
+Centralized artifact writing and path management.
 
-### 11.1 與 proposal §17 的對應
+### Class
 
-| proposal | 架構落地 |
-|---|---|
-| Q1–Q2 | AD-02 → `SplitModule` |
-| Q3 | `SplitManifest` 在 orchestrator **fold 迴圈外** 建立一次 |
-| Q4 | `SplitModule` 複製原版 target 邏輯函式 `assign_target_roles()` |
-| Q5 | AD-07 → `ExportPipeline._target_metrics_ids()` |
-| Q6–Q7 | `prediction.py` 欄位 schema |
-| Q8–Q12 | M6 + `SampleIdNormalizer` |
-| Q13–Q15 | M11 `plot_tsne_*` / `compute_kmeans_*` |
-| Q16 | M11 輸入為 full source/target latent matrices |
-| Q17–Q19 | M8 / M9 |
-| Q20–Q23 | AD-05 / orchestrator 條件分支 |
+```python
+class ArtifactWriter:
+    def __init__(self, root_dir: str, seed: int):
+        ...
+
+    def fold_dir(self, fold_id: int) -> Path:
+        ...
+
+    def write_config(self, config: MultiLabelConfig) -> None:
+        ...
+
+    def write_fold_artifacts(...):
+        ...
+```
+
+### Design Notes
+
+No model or data logic should exist here.
+
+### Unit Tests
+
+1. creates expected directory tree.
+2. writes all required files.
+3. paths are deterministic.
 
 ---
 
-## 12. 介面序列圖（單 Fold）
+## 4.27 `reports.py`
 
-```mermaid
-sequenceDiagram
-    participant O as Orchestrator
-    participant S as SplitModule
-    participant D as DataLoaderFactory
-    participant T as TrainingAdapter
-    participant E as ExportPipeline
-    participant W as ArtifactWriter
+### Responsibility
 
-    O->>S: build_split_manifest (once)
-    loop fold k
-        O->>D: build_fold_dataloaders(k)
-        O->>T: train_fold(k)
-        T-->>O: TrainingResult
-        O->>E: run(k, TrainingResult)
-        E->>E: latent + predict + eval
-        E->>W: write_fold_bundle
-    end
-    O->>W: write_summaries
+Generate human-readable summary reports.
+
+### Reports
+
+1. `data_alignment_report.csv`
+2. `drug_list.csv`
+3. `source_response_matrix.csv`
+4. `source_response_mask.csv`
+5. `target_response_matrix.csv`
+6. `target_observed_mask.csv`
+7. `target_labeled_mask.csv`
+8. `target_unlabeled_mask.csv`
+9. `target_nshot_summary.csv`
+10. `source_split_label_distribution.csv`
+11. `metrics_summary.csv`
+12. `latent_metrics_summary.csv`
+
+### Unit Tests
+
+1. reports contain expected columns.
+2. warning cases are captured.
+
+---
+
+## 5. Main Entry Point
+
+## 5.1 `experiment_multilabel_ssda.py`
+
+### Responsibility
+
+High-level orchestration only.
+
+### Pseudocode
+
+```python
+def main():
+    config = parse_args()
+    set_global_seed(config.random_seed)
+
+    writer = ArtifactWriter(config.output_dir, config.random_seed)
+    writer.write_config(config)
+
+    prepared = prepare_multilabel_data(config)
+    writer.write_preparation_artifacts(prepared)
+
+    for fold in prepared.folds:
+        model = build_multilabel_ssda_model(config, prepared.drug_index)
+        trainer = MultiLabelSSDTrainer(model, config)
+
+        train_result = trainer.train_fold(fold, prepared)
+        writer.write_train_logs(fold.fold_id, train_result)
+
+        source_pred = predict_source(...)
+        target_pred = predict_target(...)
+
+        source_metrics = compute_source_metrics(source_pred, config.task_type)
+        target_metrics = compute_target_metrics(target_pred, config.task_type)
+
+        source_latent = encode_source_latent(...)
+        target_latent = encode_target_latent(...)
+
+        latent_metrics = compute_latent_metrics(...)
+        tsne_paths = plot_tsne(...)
+
+        writer.write_fold_outputs(...)
+
+    writer.write_summary_outputs(...)
+```
+
+### Rule
+
+The entry point should not contain detailed data transformation, model internals, or metrics implementation.
+
+---
+
+## 6. Data Contracts Between Modules
+
+## 6.1 Prepared Data Contract
+
+All training modules receive `PreparedData`.
+
+They must not read original CSV again.
+
+## 6.2 Drug Index Contract
+
+All modules must use `DrugIndex`.
+
+No module may independently sort drug IDs.
+
+## 6.3 Matrix Contract
+
+For any response matrix:
+
+```text
+Y.shape == mask.shape == [n_samples, n_drugs]
+```
+
+## 6.4 Model Output Contract
+
+For any model forward pass:
+
+```text
+output.shape == [batch_size, n_drugs]
+```
+
+## 6.5 Prediction Table Contract
+
+All prediction tables must include:
+
+| Column |
+|---|
+| sample_id |
+| drug_id |
+| drug_index |
+| domain |
+| split_or_role |
+| ground_truth |
+| pred_score |
+| pred_label |
+| task_type |
+| fold |
+| seed |
+
+---
+
+## 7. Low-coupling Design Rules
+
+1. `io.py` must not know biological domain concepts.
+2. `drug_index.py` must not know model logic.
+3. `response_matrix.py` must not know training logic.
+4. `target_nshot.py` must only operate on arrays and masks.
+5. `source_split.py` must not build DataLoaders.
+6. `datasets.py` must not compute losses.
+7. `losses.py` must not know source / target semantics.
+8. `adaptation.py` must not know file paths.
+9. `trainer.py` must not write artifacts directly.
+10. `prediction.py` must not compute training loss.
+11. `metrics.py` must not run model inference.
+12. `latent.py` must not plot figures.
+13. `visualization.py` must not compute prediction metrics.
+14. `artifacts.py` must not transform data.
+
+---
+
+## 8. Error Handling and Logging
+
+### 8.1 Hard Errors
+
+The system should stop when:
+
+1. Required input file is missing.
+2. Required column is missing.
+3. Omics features are non-numeric.
+4. Target response contains values other than 0/1.
+5. Drug list is empty.
+6. Matrix and mask shapes mismatch.
+7. Model output dimension does not equal number of drugs.
+
+### 8.2 Warnings
+
+The system should continue but log warning when:
+
+1. source-only drug exists.
+2. target-only drug exists.
+3. target drug has no labels.
+4. target drug class count is below `n_shot`.
+5. a drug has only one class.
+6. AUC cannot be computed.
+7. cancer type is missing.
+8. duplicate response strategy is not `error`.
+
+### 8.3 Logs
+
+Write:
+
+```text
+run.log
+target_nshot_summary.csv
+data_alignment_report.csv
+metrics_warning_report.csv
 ```
 
 ---
 
-## 13. 風險與緩解
+## 9. Testing Strategy
 
-| 風險 | 緩解 |
-|---|---|
-| `trainer` 回傳 last epoch 而非 best | 文件與 proposal 一致；latent/pred 皆用同一 checkpoint |
-| DAE denoising 導致 latent 非 deterministic | 固定 seed；文件註明；可選 `latent_mode=encode` |
-| target test leakage（原版行為） | `SplitManifest` 明確標註 role；metrics 預設 all target |
-| fold 間 GPU OOM | 每 fold 結束 `del model; torch.cuda.empty_cache()` |
-| DAPL metrics 數值不一致 | AD-08 選定後做對照實驗記錄於 tests |
+## 9.1 Unit Tests
+
+Each module should have independent tests.
+
+Suggested structure:
+
+```text
+tests/
+  test_drug_index.py
+  test_response_matrix.py
+  test_target_nshot.py
+  test_source_split.py
+  test_losses.py
+  test_adaptation.py
+  test_model.py
+  test_prediction.py
+  test_metrics.py
+  test_latent.py
+```
+
+## 9.2 Integration Tests
+
+Create a small synthetic dataset:
+
+```text
+source samples: 8
+target samples: 6
+drugs: 4
+features: 10
+missing labels: yes
+source-only drug: yes
+target-only drug: yes
+```
+
+Integration test should verify:
+
+1. data preparation completes.
+2. one fold trains for one epoch.
+3. prediction tables are written.
+4. latent pkl files are written.
+5. metrics files are written.
 
 ---
 
-## 14. 文件修訂紀錄
+## 10. Output Directory Contract
 
-| 版本 | 日期 | 說明 |
-|---|---|---|
-| v1.0 | 2026-05-21 | 初版：模組劃分、契約、依賴、測試、AD 清單 |
+The system should create:
+
+```text
+save/
+  ssda_multilabel/
+    seed_{random_seed}/
+      config.json
+      run.log
+      drug_list.csv
+      data_alignment_report.csv
+      source_response_matrix.csv
+      source_response_mask.csv
+      target_response_matrix.csv
+      target_observed_mask.csv
+      target_labeled_mask.csv
+      target_unlabeled_mask.csv
+      target_nshot_summary.csv
+      cancer_type_mapping_summary.csv
+
+      fold_0/
+        model_final.pth
+        train_log.csv
+        source_latent_representation.pkl
+        target_latent_representation.pkl
+        source_prediction_results.csv
+        target_prediction_results.csv
+        source_metrics_per_drug.csv
+        source_metrics_summary.csv
+        target_metrics_per_drug.csv
+        target_metrics_summary.csv
+        masked_loss_log.csv
+        latent_distribution_metrics.csv
+        kmeans_cancer_type_metrics.csv
+        tsne_domain_mixing.png
+        tsne_cancer_type.png
+
+      fold_1/
+        ...
+
+      metrics_summary.csv
+      latent_metrics_summary.csv
+      kmeans_cancer_type_summary.csv
+```
 
 ---
 
-*本設計假設 proposal.md 中的功能需求為準；需求確認後請同步更新 §11 AD 與 §4 契約中的預設值。*
+## 11. Technical Tradeoffs and Decisions
+
+### 11.1 Pair Model vs Multi-output Model
+
+Decision:
+
+```text
+Use multi-output model.
+```
+
+Reason:
+
+1. User explicitly requested multi-output model.
+2. No drug latent input is needed.
+3. Source and target response matrices can be perfectly aligned through `drug_list.csv`.
+
+---
+
+### 11.2 Drug Intersection vs Drug Union
+
+Decision:
+
+```text
+Use source ∪ target union.
+```
+
+Reason:
+
+1. User explicitly requested not deleting any drug.
+2. Source-only and target-only drugs are retained.
+3. Missing domains are handled by mask.
+
+---
+
+### 11.3 Sample-level vs Position-level Target N-shot
+
+Decision:
+
+```text
+Use sample-drug position-level n-shot.
+```
+
+Reason:
+
+1. Multi-label setting requires per-drug labels.
+2. Same sample can be labeled for one drug and unlabeled for another.
+3. This preserves original SSDA n-shot idea while adapting it to multi-label data.
+
+---
+
+### 11.4 Regression Run Target Supervision
+
+Decision:
+
+```text
+Use source regression loss + target labeled BCE loss + target unlabeled adaptation loss.
+```
+
+Reason:
+
+1. Original SSDA target labeled samples participate in supervised classification loss.
+2. Target labels are always classification.
+3. A single multi-output score can be interpreted as continuous prediction for source regression and binary logit for target classification.
+
+This is a deliberate design compromise. It should be documented in code and logs.
+
+---
+
+### 11.5 Multi-label Stratification
+
+Decision:
+
+```text
+Use sample-level split. Multi-label stratification optional.
+```
+
+Reason:
+
+1. Avoid leakage across sample-drug pairs.
+2. Multi-label stratification can add dependency complexity.
+3. Label distribution reports can detect severe imbalance.
+
+Future extension can add iterative stratification.
+
+---
+
+## 12. Open Configurable Options
+
+These options should be configurable rather than hard-coded:
+
+1. `--reg_loss`: `mse`, `mae`, `huber`.
+2. `--lambda_adapt`.
+3. `--source_test_size`.
+4. `--n_splits`.
+5. `--n_shot`.
+6. `--unknown_cancer_type_policy`.
+7. `--duplicate_response_strategy`.
+8. `--export_wide_predictions`.
+9. `--use_multilabel_stratification`.
+
+---
+
+## 13. Final Acceptance Criteria
+
+The architecture is implemented correctly when:
+
+1. `drug_list.csv` contains source ∪ target drugs.
+2. model output dimension equals number of drugs.
+3. source and target matrices use identical drug order.
+4. source-only and target-only drugs are retained.
+5. missing labels do not contribute to supervised loss.
+6. target n-shot is position-level.
+7. target labeled mask and target unlabeled mask are disjoint.
+8. validation does not update model parameters.
+9. classification run works end-to-end.
+10. regression run works end-to-end.
+11. source and target prediction tables are exported in long format.
+12. source and target sample-level latent pkl files are exported.
+13. latent evaluation and t-SNE outputs are generated.
+14. all modules are independently testable.
+15. no drug latent or sample-drug pair model is introduced.

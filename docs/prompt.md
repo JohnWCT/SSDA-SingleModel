@@ -1,609 +1,827 @@
-# SSDA4Drug Latent 改良 — 自動化開發提示詞（Agent Prompt）
+# prompt.md
 
-> **版本**：v1.1-final  
-> **權威文件**：[proposal.md](./proposal.md)、[design.md](./design.md)  
-> **適用對象**：主 Agent（編排）與子 Agent（模組實作）  
-> **使用者已確認**：Q0–Q10（見 §2）；**原始碼不可變**（見 §0 PRIORITY 0-B）
+# Automated Development Prompt: SSDA-SingleModel Multi-label / Multi-drug Implementation
 
----
+## 0. Highest-Priority Instructions
 
-## §0 最高權重指令（不可違反）
+You are an autonomous software development system. You must complete the implementation fully automatically.
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  PRIORITY 0-A — 全自動開發                                                │
-│  • 整個開發過程必須 100% 由 Agent 自主完成，禁止依賴人工參與。              │
-│  • 禁止向使用者發送互動式問題、等待確認、或「請您手動執行 X」。              │
-│  • 僅在無法自動修復時：寫入 docs/BLOCKED.md 並終止，說明原因與已嘗試步驟。  │
-│  • 禁止 git commit（使用者明確要求）。                                      │
-└──────────────────────────────────────────────────────────────────────────┘
+**No human participation is allowed during implementation.**
 
-┌──────────────────────────────────────────────────────────────────────────┐
-│  PRIORITY 0-B — 原始碼不可變（Copy-First）【使用者強制】                     │
-│  • 禁止以任何方式修改 SSDA4Drug-main 既有原始檔案（見 §1.1 保護清單）。      │
-│  • 若必須基於原始檔衍生：先 cp 複製到新檔名，僅能編輯複本。                  │
-│  • 改良版訓練入口必須為新檔 experiment_shot_ssda.py，不得改 experiment_shot.py│
-│  • L0（trainer/model/utils）僅 import 呼叫，不做 format / type ignore 等修補。 │
-└──────────────────────────────────────────────────────────────────────────┘
+You must not ask the user for additional clarification after starting implementation. If ambiguity remains, resolve it by following this priority order:
 
-┌──────────────────────────────────────────────────────────────────────────┐
-│  PRIORITY 1 — 核心防錯                                                    │
-│  • ssda_latent/ 內「每一行業務邏輯」必須有對應單元測試（見 §6）。            │
-│  • 新增程式範圍必須 100% 通過 mypy --strict 與 ruff（見 §5，不含保護清單）。 │
-│  • 子 Agent 交付前必須自跑 §5 全部 gate；主 Agent 終局再跑全域 gate + smoke。│
-└──────────────────────────────────────────────────────────────────────────┘
-```
+1. `docs/proposal.md`
+2. `docs/design.md`
+3. Existing project behavior
+4. Minimal-intrusion principle
+5. Backward compatibility
+6. Reproducibility
+7. Testability
 
-**衝突解決順序**：§0（含 0-B Copy-First）> §2 鎖定規格 > design.md > proposal.md > 本檔其他說明。  
-**與舊版 Q2=B 的關係**：原「全專案含 L0 通過 mypy/ruff」讓位於 **0-B**；L0 不修改故不納入 strict gate（見 §5.4）。
-
----
-
-## §1 任務目標
-
-在 `SSDA4Drug-main/` 實作 **SSDA4Drug Latent 改良版**（**僅新增/複製檔案，不動原始碼**）：
-
-- 單一 `--random_seed`；source 10% independent test + 5-fold stratified CV
-- 保留原版 semi-supervised domain adaptation（**import** 既有 `trainer.py`，loss 不變）
-- 每 fold 輸出：latent pkl、prediction CSV、t-SNE、FID/MMD/Wasserstein、KMeans metrics
-- 新增套件 `ssda_latent/`（見 design.md §2）
-- 新增入口 **`experiment_shot_ssda.py`**（改良版 CLI，原版 `experiment_shot.py` 保持不變）
-- 更新 `README.md`；維護 `docs/IMPLEMENTATION_LOG.md`
-
-### §1.1 原始碼保護清單（禁止直接修改）
-
-以下檔案視為 **SSDA4Drug 原始碼**，Agent **不得** 對其做任何編輯（含 format、註解、type ignore、刪行、改名）：
-
-| 類別 | 路徑 |
-|---|---|
-| 訓練入口（原版） | `experiment_shot.py` |
-| 延伸實驗入口 | `experiment.py` |
-| 訓練核心 | `trainer.py` |
-| 模型 | `model.py` |
-| 工具 | `utils.py` |
-| 對照實驗 | `Benchmark/**` 下所有既有 `.py` |
-| 前處理（既有） | `Datasets/preprocess_benchmark.py`、`Datasets/split_data.py`、`Datasets/n_shot.py` 等既有腳本 |
-
-**允許新增、不視為修改原始碼**：
-
-- `ssda_latent/**`
-- `tests/**`
-- `experiment_shot_ssda.py`（新建或自 `experiment_shot.py` **複製後**再改）
-- `pyproject.toml`、`docs/*`（含本 prompt 與 IMPLEMENTATION_LOG）
-- `save/**` 執行期輸出
-
-### §1.2 Copy-First 工作流程（必須遵守）
-
-當邏輯需參考或衍生自原始檔時：
-
-```bash
-# 正確：先複製，只改複本
-cp experiment_shot.py experiment_shot_ssda.py
-# 僅編輯 experiment_shot_ssda.py
-
-# 錯誤：直接改原始檔
-# vim experiment_shot.py   ← 禁止
-```
-
-- **禁止**「暫時改一下原版再改回來」；`git checkout` 還原仍視為違規。
-- 從原版**複製邏輯**到 `ssda_latent/` 時：在複製出的模組內重寫（如 `split.py`），**不要** patch 原版。
-- `training_adapter.py` 透過 `import trainer`、`import model as m`、`import utils` 呼叫 L0，**不得** fork 修改 `trainer.py` 副本（除非使用者日後明確要求且仍走 copy-first 命名，例如 `trainer_ssda.py`；**本專案預設不需要**）。
-
----
-
-## §2 已鎖定規格（使用者 Q0 全部同意 + Q1–Q10）
-
-| 類別 | 鎖定值 |
-|---|---|
-| 套件 | `ssda_latent/`（AD-01） |
-| Source split | `source_test_size=0.1`，**stratified**；`StratifiedKFold(n_splits=5)` |
-| Target split | 原版 80/20 → train/val 各 n-shot → test（含 val labeled 仍在 test，不修正 leakage） |
-| Target few-shot | **固定一次**，所有 fold 共用 |
-| Checkpoint | 僅 `model_final.pth`（**last epoch**） |
-| DAE latent | `encoder.forward()` → `[0]`（含 denoising） |
-| Confidence | softmax `P(class=0)`, `P(class=1)`, `confidence=P(class=1)` |
-| Legacy 輸出 | **保留** `save/results/sc/`、`save/sc/all_path/` |
-| Cancer type 缺失 | 標記 `Unknown`；KMeans **排除** Unknown |
-| FID/MMD/Wasserstein | **本 repo 自實作**（不依賴 DAPL 路徑） |
-| 輸出目錄已存在 | **overwrite** |
-| 50-seed loop | **移除**，僅單一 seed |
-| 品質 gate | mypy `--strict` + ruff（**僅新增程式範圍**，見 §5.4；**不修改 L0**） |
-| 原始碼 | **禁止修改**保護清單（§1.1）；必要時 **copy-first**（§1.2） |
-| 改良入口 | **`experiment_shot_ssda.py`**（不得改 `experiment_shot.py`） |
-| Coverage | **不設**下限；每個公開函式 ≥1 測試（Q3=A） |
-| 測試邊界 | 見 §6（Q4 同意） |
-| Smoke | **必須**在 Docker `SSDA` 內跑真實 Gefitinib（Q5=B） |
-| 子任務粒度 | **一模組一子 Agent**（Q6） |
-| 重試 | 子任務失敗自動重試 **最多 3 次**（Q7） |
-| Cancer type 檔 | 測試用 **synthetic fixture**（Q8 cancer=A） |
-| 資料缺失 | **自動** `preprocess_benchmark.py`（Q8 data=A） |
-| torch 型別 | `ignore_missing_imports` + 必要 `# type: ignore` 附理由（Q8 torch=A） |
-| 規格衝突 | 以 proposal+design 為準，寫 log，不問人（Q8 conflict=A） |
-| 阻塞終止 | 允許 `docs/BLOCKED.md`（Q9） |
-| 文件 | 更新 README、維護 IMPLEMENTATION_LOG（Q10） |
-| Git | **禁止 commit**（Q10） |
-
----
-
-## §3 角色定義
-
-### 3.1 主 Agent（Main Agent）
-
-**職責**：
-
-1. 閱讀 `docs/proposal.md`、`docs/design.md`、本 `prompt.md`
-2. **環境準備**（§4）：建立 `pyproject.toml`、`ruff`/`mypy`/`pytest` 設定
-3. 依 **P0→P4** 向子 Agent **派工**（§7）；每任務對應單一模組 + 測試檔
-4. 審核子 Agent 交付：§5 gate 全綠、§6 測試對齊、§1.1 保護清單 **零 diff**
-5. 子任務失敗 → **自動重試 ≤3 次**；仍失敗 → 記錄 `IMPLEMENTATION_LOG.md` 並嘗試主 Agent 自行修復或寫 `BLOCKED.md`
-6. **終局驗證**：§5 全域 gate + §8 Docker smoke + §9 DoD 清單
-7. 更新 `README.md`、`docs/IMPLEMENTATION_LOG.md`
-
-**禁止**：
-
-- 跳過子 Agent 測試要求直接合併大段未測試程式
-- **修改 §1.1 保護清單內任一原始檔**（含 `experiment_shot.py`）
-- `git commit` / 向使用者提問
-
-**允許**：
-
-- 新增 `experiment_shot_ssda.py`（建議：`cp experiment_shot.py` 後改為薄入口 + 新 CLI）
-- 新增 `ssda_latent/`、`tests/`、`pyproject.toml`
-
----
-
-### 3.2 子 Agent（Sub Agent）
-
-**職責**：
-
-1. 僅實作**被指派的一個模組**（`ssda_latent/<module>.py`）及對應 `tests/test_<module>.py`
-2. 同步撰寫業務邏輯與測試（§6）；交付前執行 §5.1 本地 gate
-3. 回報：變更檔案列表、通過的 command 輸出摘要、已知限制
-
-**禁止**：
-
-- 修改指派模組以外的檔案（除 `tests/`、`pyproject.toml` 若主 Agent 授權）
-- 修改 §1.1 **保護清單**內任何原始檔
-- 省略測試、跳過 mypy/ruff
-
-**允許**：
-
-- `import trainer` / `import model` / `import utils`（唯讀使用 L0）
-
----
-
-### 3.3 協作協議
+Every non-trivial implementation decision made because of ambiguity must be recorded in:
 
 ```text
-主 Agent                          子 Agent #N
-   │                                  │
-   ├─ 派工單 (§7 模板) ──────────────►│
-   │                                  ├─ 實作 module + test
-   │                                  ├─ 跑 §5.1
-   │◄──────── 交付報告 ───────────────┤
-   ├─ 驗證 gate / §1.1 保護清單零 diff
-   ├─ 失敗？重試 ≤3
-   └─ 更新 IMPLEMENTATION_LOG
+docs/implementation_decisions.md
 ```
+
+You must also create:
+
+```text
+docs/implementation_report.md
+```
+
+The implementation report must include completed modules, modified files, new files, design decisions, test results, known limitations, and exact commands used to validate the implementation.
 
 ---
 
-## §4 環境準備（主 Agent 首要任務）
+## 1. Execution Environment Rules
 
-### 4.1 工作目錄
+The project must be developed and tested **inside the existing Docker container only**.
+
+The user already started the container with:
 
 ```bash
-cd /home/wasijk/Drug/SSDA4Drug-main
-# 或 Docker 內：cd /workspace/SSDA4Drug-main 2>/dev/null || cd /workspace/SSDA4Drug
+docker run --gpus all -itd --name SSDA -v "$PWD":/workspace/SSDA4Drug ssda4drug:cuda121
 ```
 
-### 4.2 依賴安裝（全自動）
+Do not start a new container. Do not modify the local host Python environment. Do not install dependencies on the host machine.
 
-主 Agent 必須建立或更新 `pyproject.toml`（含 dev extras）：
-
-```toml
-[project]
-name = "ssda4drug"
-requires-python = ">=3.9"
-dependencies = [
-  "torch>=2.1",
-  "pandas>=2.0",
-  "numpy>=1.24",
-  "scikit-learn>=1.3",
-  "matplotlib>=3.7",
-]
-
-[project.optional-dependencies]
-dev = ["pytest>=7.4", "mypy>=1.8", "ruff>=0.4", "pandas-stubs", "types-requests"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-
-[tool.mypy]
-python_version = "3.9"
-strict = true
-ignore_missing_imports = true
-
-[tool.ruff]
-line-length = 100
-target-version = "py39"
-
-[tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "N"]
-```
-
-安裝：
+All code inspection, editing, testing, linting, formatting, and execution must happen through commands similar to:
 
 ```bash
-pip install -e ".[dev]"
+docker exec -it SSDA bash
 ```
 
-### 4.3 資料準備（全自動，Q8 data=A）
-
-若缺少 processed 資料：
+or non-interactive commands such as:
 
 ```bash
-python Datasets/preprocess_benchmark.py --drug Gefitinib
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && pytest"
 ```
 
-確認四檔存在：
+The expected project path inside the Docker container is approximately:
 
-- `Datasets/processedData/Gefitinib/source_data/source_scaled_tp4k.csv`
-- `Datasets/processedData/Gefitinib/source_data/source_meta_data.csv`
-- `Datasets/processedData/Gefitinib/target_data/target_scaled_tp4k.csv`
-- `Datasets/processedData/Gefitinib/target_data/target_meta_data.csv`
+```text
+/workspace/SSDA4Drug
+```
 
-### 4.4 Cancer type 測試資料（Q8 cancer=A）
+If the actual repository root differs, detect it automatically from inside the container and record the detected path in `docs/implementation_decisions.md`.
 
-主 Agent 在 `tests/fixtures/` 建立 synthetic CSV，**不依賴**使用者提供實檔：
-
-- `tests/fixtures/source_cancer_type.csv`（`Sample_ID`, `Cancer_type`）
-- `tests/fixtures/target_cancer_type.csv`
-
-sample ID 必須與 `Gefitinib` processed meta index 可對齊（讀取實際 meta 取子集生成）。
+All validation commands must be executed from the project root inside the Docker container.
 
 ---
 
-## §5 品質閘門（100% 通過定義）
+## 2. Required Role Structure
 
-### 5.1 每次子 Agent 交付前必跑
+The development process must be organized as two explicit roles.
+
+### 2.1 Main Agent
+
+The Main Agent is responsible for orchestration.
+
+Responsibilities:
+
+1. Read and understand `docs/proposal.md`.
+2. Read and understand `docs/design.md`.
+3. Inspect the existing repository structure.
+4. Confirm the Docker container environment.
+5. Create an implementation plan from the design document.
+6. Split work into independent module-level tasks.
+7. Assign each module task to a Sub Agent.
+8. Enforce low coupling between modules.
+9. Ensure every business logic change has corresponding tests.
+10. Ensure all checks pass.
+11. Integrate module outputs.
+12. Resolve conflicts between modules.
+13. Maintain `docs/implementation_decisions.md`.
+14. Maintain `docs/implementation_report.md`.
+15. Run final validation inside Docker.
+16. Stop only when the project is fully implemented and all checks pass.
+
+The Main Agent must not write large feature modules directly unless a Sub Agent task is too small to justify delegation.
+
+### 2.2 Sub Agent
+
+A Sub Agent is responsible for concrete implementation of a specific module.
+
+Each Sub Agent must:
+
+1. Read the relevant section of `docs/proposal.md`.
+2. Read the relevant section of `docs/design.md`.
+3. Implement only its assigned module.
+4. Avoid unrelated changes.
+5. Add unit tests for every public function, class, branch, data transformation rule, mask rule, loss rule, and edge case.
+6. Add or update documentation comments where helpful.
+7. Run module-specific tests inside Docker.
+8. Report changed files and test results to the Main Agent.
+
+A Sub Agent must not silently change interfaces owned by another module. If an interface change is required, the Sub Agent must document the reason and ask the Main Agent to coordinate the change internally. This does not involve asking the human user.
+
+---
+
+## 3. Core Safety and Quality Rules
+
+### 3.1 Unit Test Requirement
+
+For every line of business logic code, the corresponding behavior must be covered by unit tests.
+
+This means:
+
+1. Every public function must have tests.
+2. Every public class must have tests.
+3. Every important private helper must have tests if it contains business logic.
+4. Every branch must be tested.
+5. Every mask rule must be tested.
+6. Every target n-shot edge case must be tested.
+7. Every long-to-wide conversion rule must be tested.
+8. Every drug list union/order rule must be tested.
+9. Every loss function must be tested.
+10. Every metric function must be tested.
+11. Every export format must be tested.
+12. Every source/target split rule must be tested.
+13. Every deterministic latent export rule must be tested.
+14. Every validation-no-update rule must be tested.
+
+Test code must be committed alongside implementation code.
+
+### 3.2 Required Check Tools
+
+All code must pass 100% of the following checks:
 
 ```bash
-cd SSDA4Drug-main
-
-# 檢查範圍（僅新增程式 — 見 §5.4）
-GATE_PATHS="ssda_latent tests experiment_shot_ssda.py"
-
-# 1. Lint
-ruff check $GATE_PATHS
-ruff format --check $GATE_PATHS
-
-# 2. 型別
-mypy ssda_latent tests experiment_shot_ssda.py
-
-# 3. 測試
-pytest tests/ -v --tb=short
+ruff check .
+ruff format --check .
+mypy .
+pytest
+pytest --cov
 ```
 
-**通過標準**：三項命令 **exit code 0**，無 error；warning 亦需消除或經 `pyproject.toml` 設定豁免（需註明理由）。
+If the repository does not already contain configuration files, the Main Agent may add minimal project configuration files such as `pyproject.toml`, `pytest.ini`, or `mypy.ini`.
 
-### 5.2 主 Agent 終局必跑
+If legacy code is not type-clean, configure `mypy` to focus on the new multi-label modules first, while documenting this decision in `docs/implementation_decisions.md`.
 
-§5.1 全部，加上 **原始檔零變更檢查**（§5.5）。
+Core new modules must reach at least 85% test coverage. If legacy code prevents total repository coverage from reaching 85%, record the reason in `docs/implementation_report.md` and still ensure the new modules satisfy the threshold.
 
-### 5.3 與舊版 Q2=B 的取代說明
+### 3.3 Docker-only Validation Commands
 
-使用者曾選 Q2=B（全專案 gate），後新增 **PRIORITY 0-B（原始碼不可變）**。二者衝突時以 **0-B 為準**：
+All checks must be executed inside Docker.
 
-- **不再** 為通過 mypy/ruff 而修改 `trainer.py` / `model.py` / `utils.py` / `experiment_shot.py`
-- 品質 gate **僅** 套用於 §5.4 範圍
-
-### 5.4 mypy / ruff 檢查範圍（新增程式）
-
-| 納入 | 不納入 |
-|---|---|
-| `ssda_latent/**` | `trainer.py`, `model.py`, `utils.py` |
-| `tests/**` | `experiment_shot.py`, `experiment.py` |
-| `experiment_shot_ssda.py` | `Benchmark/**` |
-
-`pyproject.toml` 建議明確設定：
-
-```toml
-[tool.mypy]
-exclude = ["Benchmark/", "trainer.py", "model.py", "utils.py", "experiment_shot.py", "experiment.py"]
-
-[tool.ruff]
-exclude = ["Benchmark", "trainer.py", "model.py", "utils.py", "experiment_shot.py", "experiment.py"]
-```
-
-### 5.5 原始檔零變更檢查（必須通過）
+Preferred pattern:
 
 ```bash
-# 保護清單內檔案不得出現在 git diff / 檔案 hash 變更中
-git diff -- experiment_shot.py experiment.py trainer.py model.py utils.py
-
-# 若有輸出 → 違反 PRIORITY 0-B，任務失敗，須還原並改為 copy-first
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && ruff check ."
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && ruff format --check ."
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && mypy ."
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && pytest"
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && pytest --cov"
 ```
 
-主 Agent 亦可在無 git 時，對保護清單計算實作前後 SHA256 比對（實作開始前先記錄 baseline 至 `IMPLEMENTATION_LOG.md`）。
+If the project root is different, replace `/workspace/SSDA4Drug` with the detected path.
+
+Do not run these commands on the host machine.
 
 ---
 
-## §6 測試強制規則（核心防錯）
+## 4. Required Development Style
 
-### 6.1 何謂「業務邏輯」（必須有測試）
+Every module implementation must include clear explanation of the logic and design choices.
 
-- `ssda_latent/` 內所有 **`def` 公開函式**（不以下底線開頭）
-- 含分支、迴圈、條件判斷的 **私有函式**（需直接測或透過公開 API 完整覆蓋分支）
-- `experiment_shot_ssda.py` 中 `build_experiment_config` / `main` 編排邏輯
+For each implemented module, document:
 
-**規則**：新增或修改 N 行業務邏輯 → 同一 PR/任務內新增/更新測試，使該邏輯被執行到。
+1. What the module does.
+2. What inputs it expects.
+3. What outputs it produces.
+4. How it avoids coupling with other modules.
+5. What assumptions it makes.
+6. What edge cases it handles.
+7. Which tests verify it.
 
-### 6.2 可免單元測試
+The final `docs/implementation_report.md` must explain each step in plain language.
 
-| 項目 | 說明 |
-|---|---|
-| `model.py`、`trainer.py` 既有邏輯 | L0 **不可修改**；透過 import 覆蓋行為，不寫 L0 單測 |
-| `experiment_shot_ssda.py` | 至少 1 個整合測試（mock Runner 或 subprocess smoke） |
-| 純常數、`ARTIFACT_NAMES` 僅 dict 定義 | 由使用方測試覆蓋 |
-| 空 `__init__.py` re-export | 無邏輯 |
+---
 
-### 6.3 測試檔對應表（必須齊全）
+## 5. Project Goal
 
-| 模組 | 測試檔 |
-|---|---|
-| `config.py` | `tests/test_config.py` |
-| `seed.py` | `tests/test_seed.py` |
-| `paths.py` | `tests/test_paths.py` |
-| `data_loading.py` | `tests/test_data_loading.py` |
-| `split.py` | `tests/test_split.py` |
-| `cancer_type.py` | `tests/test_cancer_type.py` |
-| `dataloader_factory.py` | `tests/test_dataloader_factory.py` |
-| `training_adapter.py` | `tests/test_training_adapter.py` |
-| `latent.py` | `tests/test_latent.py` |
-| `prediction.py` | `tests/test_prediction.py` |
-| `latent_eval.py` | `tests/test_latent_eval.py` |
-| `artifacts.py` | `tests/test_artifacts.py` |
-| `export_pipeline.py` | `tests/test_export_pipeline.py` |
-| `summary.py` | `tests/test_summary.py` |
-| `orchestrator.py` | `tests/test_orchestrator.py` |
+Implement a multi-label / multi-drug version of SSDA-SingleModel.
 
-### 6.4 測試設計要求
+The new system must transform the current single-drug SSDA pipeline into:
 
-- **禁止** 依賴網路、人工互動
-- **優先** 合成小 DataFrame / mock `nn.Module` / `tmp_path` fixture
-- `split`：固定 seed 快照比對 split 互斥、stratified 比例
-- `latent_eval`：固定矩陣 FID/MMD/Wasserstein 為有限值
-- `prediction`：全 0/1 標籤邊界、AUC 行為
-- Torch 模組：mock encoder 回傳固定 tensor；**禁止** 假設 CI 有 GPU 才能過單元測試
+```text
+omics data table
+  -> SSDA encoder
+  -> sample-level latent representation
+  -> multi-output drug response head
+  -> all-drug response vector
+```
 
-### 6.5 整合 / Smoke（Q5=B）
+The model must output one response vector per sample:
 
-單元測試通過後，主 Agent **必須**在 Docker 執行：
+```text
+prediction shape = [batch_size, n_drugs]
+```
+
+The drug dimension is defined by `drug_list.csv`.
+
+The system must support multi-label classification, multi-label regression, masked loss, source sample-level train/validation/test split, target sample-drug position-level n-shot adaptation, target classification labels, source/target prediction exports, source/target sample-level latent pkl export, and latent visual/metric evaluation.
+
+---
+
+## 6. Non-negotiable Design Decisions
+
+1. Omics input must remain raw data tables, as in SSDA-SingleModel.
+2. Do not require precomputed sample latent input.
+3. Do not use drug latent input.
+4. Delete or avoid all drug latent assumptions.
+5. Do not implement a sample-drug pair model.
+6. Use a multi-output head.
+7. Each sample outputs all drug predictions at once.
+8. Source and target response inputs are long tables.
+9. Long tables must be converted to wide response matrices plus mask tensors.
+10. Missing labels must be handled by mask loss.
+11. Each run uses one task type: `--task_type classification` or `--task_type regression`.
+12. Target labels are always binary classification labels.
+13. Regression threshold is fixed: `neg_log2_auc >= 1.0 -> responder = 1`.
+14. Drug list is the union of source and target drugs.
+15. No drug is removed merely because it appears in only one domain.
+16. `drug_list.csv` fixes the output column order.
+17. Source split is sample-level.
+18. Target n-shot is sample-drug position-level.
+19. Each drug and each class may contribute up to `n_shot` target labeled positions.
+20. If a target drug/class has fewer than `n_shot`, sample all available positions and record a warning.
+21. If a target drug has no labels, skip its target n-shot sampling and record a warning.
+22. Latent export remains sample-level, not sample-drug-level.
+23. Validation must not update model parameters.
+24. Preserve legacy behavior where practical.
+
+---
+
+## 7. Required Modules
+
+The system must be divided into independent modules with low coupling.
+
+Recommended package:
+
+```text
+ssda_multilabel/
+  __init__.py
+  config.py
+  io.py
+  drug_index.py
+  response_matrix.py
+  masks.py
+  split.py
+  dataset.py
+  model.py
+  losses.py
+  adaptation.py
+  training.py
+  prediction.py
+  metrics.py
+  latent.py
+  latent_eval.py
+  export.py
+  reports.py
+  seed.py
+```
+
+If integrating with the existing `ssda_latent/` package is cleaner, the Main Agent may do so, but the module boundaries must remain clear.
+
+---
+
+## 8. Module Specifications
+
+### 8.1 `config.py`
+
+Responsibilities:
+
+1. Define CLI arguments.
+2. Parse configuration.
+3. Validate required inputs.
+4. Store task type, paths, seed, output directory, n-shot and fold settings, loss weights, and regression loss type.
+5. Serialize configuration to `config.json`.
+
+Required CLI arguments include:
 
 ```bash
-docker exec SSDA bash -lc '
-  cd /workspace/SSDA4Drug-main 2>/dev/null || cd /workspace/SSDA4Drug
-  python Datasets/preprocess_benchmark.py --drug Gefitinib
-  python experiment_shot_ssda.py \
-    --drug Gefitinib --n 3 --encoder DAE --epochs 2 \
-    --random_seed 42 --source_test_size 0.1 --n_splits 2 \
-    --latent_output_dir save/latent_ssda
-'
+--task_type classification
+--task_type regression
+--source_omics_path
+--target_omics_path
+--source_response_path
+--target_response_path
+--sample_id_col Sample_ID
+--drug_id_col drug_id
+--response_col response
+--source_cancer_type_path
+--target_cancer_type_path
+--cancer_type_col cancer_type
+--random_seed 42
+--source_test_size 0.1
+--n_splits 5
+--n_shot 3
+--reg_loss mse
+--lambda_adapt 0.1
+--latent_output_dir save/ssda_multilabel
 ```
 
-> **注意**：使用 **`experiment_shot_ssda.py`**，**不要** 執行原版 `experiment_shot.py`（後者應保持 50-seed 等原始行為不變）。
+Tests must verify required arguments, invalid task type, default values, path handling, and serialization.
 
-**Smoke 斷言（腳本或 pytest integration）**：
+### 8.2 `io.py`
 
-- 存在 `save/latent_ssda/Gefitinib/seed_42/fold_0/source_latent_representation.pkl`
-- pkl 樣本數 = source 全體樣本數
-- 每個 latent 向量長度 = **128**
-- `source_prediction_results.csv` 行數 = source 樣本數
-- `target_prediction_results.csv` 行數 = target 樣本數
+Responsibilities:
 
-若 Docker / GPU 不可用：寫 `BLOCKED.md`，**不得**改為跳過 smoke 仍宣稱完成（Q5=B）。
+1. Read omics tables.
+2. Read response long tables.
+3. Read cancer type metadata.
+4. Validate required columns.
+5. Normalize sample IDs if needed.
+6. Align source and target omics features.
+7. Report removed or missing features.
 
----
+Tests must verify CSV loading, missing-column errors, feature intersection, numeric feature coercion, and sample ID retention.
 
-## §7 派工清單（主 Agent 執行順序）
+### 8.3 `drug_index.py`
 
-### 派工單模板（複製給子 Agent）
+Responsibilities:
 
-```markdown
-## Sub-Agent Task: <MODULE_ID>
+1. Build drug union from source and target response tables.
+2. Sort drug IDs deterministically.
+3. Create `drug_list.csv`.
+4. Load existing `drug_list.csv` if needed.
+5. Map `drug_id -> drug_index` and `drug_index -> drug_id`.
 
-**Scope**: 僅允許修改
-- ssda_latent/<module>.py
-- tests/test_<module>.py
-- tests/fixtures/*（若需要）
+Rule:
 
-**Forbidden**: 修改 §1.1 保護清單內原始檔、其他 ssda_latent 模組
-
-**Spec**: docs/design.md §<section>, docs/proposal.md §<section>
-
-**Deliverables**:
-1. 實作完成
-2. tests 覆蓋所有公開函式與關鍵分支
-3. 貼上 §5.1 三項命令成功輸出（最後 20 行）
-
-**Retry**: 這是第 {k}/3 次嘗試
+```text
+drug_list = sorted(unique(source.drug_id ∪ target.drug_id))
 ```
 
-### P0 — 基礎切分與骨架
+Tests must verify source-only drugs retained, target-only drugs retained, shared drugs retained once, deterministic sorting, stable mapping, and continuous indices starting at 0.
 
-| 任務 ID | 模組 | 依賴 | 驗收 |
-|---|---|---|---|
-| P0-1 | `config.py` + test | 無 | `ExperimentConfig` 從 argparse 建構 |
-| P0-2 | `seed.py` + test | P0-1 | 同 seed 可重現 |
-| P0-3 | `paths.py` + test | P0-1 | `RunLayout` 路徑正確 |
-| P0-4 | `data_loading.py` + test | P0-1 | 讀 Gefitinib 四檔為 sample×gene |
-| P0-5 | `split.py` + test | P0-4 | stratified test + 5-fold + target n-shot |
-| P0-6 | `orchestrator.py` 骨架 + test | P0-1~5 | fold loop 空跑寫 split CSV |
+### 8.4 `response_matrix.py`
 
-### P1 — 訓練銜接
+Responsibilities:
 
-| 任務 ID | 模組 | 驗收 |
-|---|---|---|
-| P1-1 | `dataloader_factory.py` + test | 產出與原版結構相同的三組 DataLoader |
-| P1-2 | `training_adapter.py` + test | mock 可呼叫 `train_semi_*`；寫 legacy + model_final.pth |
-| P1-3 | `experiment_shot_ssda.py` | `cp experiment_shot.py` 後改薄入口；**原版不動** |
+1. Convert source long response table to wide matrix.
+2. Convert target long response table to wide matrix.
+3. Generate response masks.
+4. Use the shared drug index.
+5. Preserve sample order.
+6. Handle duplicated sample-drug rows deterministically.
 
-### P2 — Latent 與 Prediction 匯出
+Required outputs:
 
-| 任務 ID | 模組 | 驗收 |
-|---|---|---|
-| P2-1 | `latent.py` + test | pkl dict 格式、dim=128 |
-| P2-2 | `prediction.py` + test | softmax 欄位、metrics |
-| P2-3 | `artifacts.py` + test | 寫檔不破壞、overwrite |
-| P2-4 | `export_pipeline.py` + test | 串接 latent+pred+metrics 檔名 |
-
-### P3 — Cancer type 與 Latent 評估
-
-| 任務 ID | 模組 | 驗收 |
-|---|---|---|
-| P3-1 | `cancer_type.py` + test | fixture 對齊、Unknown 策略 |
-| P3-2 | `latent_eval.py` + test | FID/MMD/WS、t-SNE 不 crash、KMeans 排除 Unknown |
-
-### P4 — 彙整與終局
-
-| 任務 ID | 工作 | 驗收 |
-|---|---|---|
-| P4-1 | `summary.py` + test | 5-fold summary CSV |
-| P4-2 | 主 Agent | orchestrator 完整串接 export + summary |
-| P4-3 | 主 Agent | README 更新、IMPLEMENTATION_LOG 完結 |
-| P4-4 | 主 Agent | §8 Docker smoke 通過 |
-
----
-
-## §8 輸出目錄契約（必須實作）
-
-根路徑：`save/latent_ssda/{drug}/seed_{seed}/`
-
-每 fold 至少包含（見 proposal §11）：
-
-- `model_final.pth`
-- `source_latent_representation.pkl`、`target_latent_representation.pkl`
-- `source_latent_metadata.csv`、`target_latent_metadata.csv`
-- `source_prediction_results.csv`、`target_prediction_results.csv`
-- `tsne_domain_mixing.png`
-- `latent_distribution_metrics.csv`
-- `source_val_metrics.csv`、`source_test_metrics.csv`、`target_prediction_metrics.csv`
-- 若提供 cancer type：`tsne_cancer_type.png`、`kmeans_cancer_type_metrics.csv`
-
-Seed 級：
-
-- `config.json`、`source_split.csv`、`target_fewshot_split.csv`
-- `metrics_summary.csv`、`latent_metrics_summary.csv`（及 kmeans summary 若適用）
-
----
-
-## §9 完成定義（Definition of Done）
-
-主 Agent 僅在以下 **全部** 滿足時宣告完成：
-
-- [ ] `ssda_latent/` 模組與 `tests/` 對應表 §6.3 **齊全**
-- [ ] §5.1 gate 於 §5.4 範圍內 **全過**
-- [ ] §5.5 保護清單（§1.1）**零 diff**
-- [ ] `experiment_shot_ssda.py` 可執行：單 seed + 5-fold + `ExperimentRunner`
-- [ ] `experiment_shot.py` **內容與實作前 baseline 一致**（未改動）
-- [ ] §8 Docker smoke **通過**（Q5=B）
-- [ ] `README.md` 已更新執行方式與新 CLI
-- [ ] `docs/IMPLEMENTATION_LOG.md` 記錄各階段與 gate 結果
-- [ ] **未執行** `git commit`
-- [ ] 無未解決的 `BLOCKED.md`（或 BLOCKED 已解消）
-
----
-
-## §10 文件維護
-
-### 10.1 `docs/IMPLEMENTATION_LOG.md`（主 Agent 持續更新）
-
-每完成子任務追加：
-
-```markdown
-## [YYYY-MM-DD HH:MM] P0-5 split.py
-- Agent: sub-agent / retry 2
-- Files: ssda_latent/split.py, tests/test_split.py
-- Gates: ruff ✓ mypy ✓ pytest 42 passed
-- Notes: ...
+```text
+Y_source: [n_source_samples, n_drugs]
+mask_source: [n_source_samples, n_drugs]
+Y_target: [n_target_samples, n_drugs]
+mask_target_observed: [n_target_samples, n_drugs]
 ```
 
-### 10.2 `docs/BLOCKED.md`（僅阻塞時建立）
+Tests must verify long-to-wide conversion, missing labels, observed labels, source-only and target-only drug columns, duplicate handling, and drug order.
 
-必含：阻塞原因、重試 3 次摘要、建議後續（給人閱讀但**不等待**人修復）。
+### 8.5 `masks.py`
 
-### 10.3 `README.md` 更新要點
+Responsibilities:
 
-- 新增 `ssda_latent` 流程說明
-- **改良版**執行：`python experiment_shot_ssda.py ...`（新 CLI）
-- **原版**仍為：`python experiment_shot.py ...`（行為不變，文件註明兩者並存）
-- Docker smoke 命令（§6.5，使用 `experiment_shot_ssda.py`）
+1. Generate target labeled mask.
+2. Generate target unlabeled mask.
+3. Implement position-level n-shot.
+4. Record warnings for insufficient labels.
+5. Ensure masks are non-overlapping.
 
----
+Rules:
 
-## §11 子 Agent 實作要點速查
+```text
+for each drug:
+    sample up to n_shot positions from class 0
+    sample up to n_shot positions from class 1
+```
 
-### 11.1 `split.py`
+Definitions:
 
-- `train_test_split(..., stratify=y['response'])` for source test
-- `StratifiedKFold(5, shuffle=True, random_state=seed)`
-- Target：將 `experiment_shot.py` L90–118 **邏輯抄寫**至 `assign_target_roles()`（讀原版、寫 `ssda_latent/split.py`，**不改**原版檔案）
-- 輸出 `SplitManifest`（design §4.3）
+```text
+mask_target_labeled: observed positions selected for supervised target loss
+mask_target_unlabeled = mask_target_observed - mask_target_labeled
+```
 
-### 11.2 `training_adapter.py`
+Tests must verify per-drug sampling, per-class sampling, position-level behavior, repeated samples across different drugs, no-label drugs, low-count classes, non-overlap, mask identity, and reproducibility.
 
-- 將 `experiment_shot.py` 內模型建構邏輯**抄寫**至本模組（或 `experiment_shot_ssda.py`），`import trainer` 呼叫 `train_semi_dae/mlp`
-- 回傳 **last epoch** 模型；`torch.save` → `model_final.pth`
-- 同時寫 legacy `save/results/sc/`、`save/sc/all_path/`（AD-05）
+### 8.6 `split.py`
 
-### 11.3 `latent.py`
+Responsibilities:
+
+1. Split source samples into source_test and source_train_val.
+2. Create sample-level K-fold splits.
+3. Ensure no sample leakage.
+4. Save split tables.
+
+Rules:
+
+1. Source split is sample-level.
+2. Source test is excluded from all fold train/validation sets.
+3. Use deterministic random seed.
+4. Use stratification when feasible; if not feasible, fall back safely and record decision.
+
+Tests must verify no leakage, fold coverage, reproducibility, correct split labels, and small dataset behavior.
+
+### 8.7 `dataset.py`
+
+Responsibilities:
+
+1. Provide PyTorch datasets for source and target matrices.
+2. Return omics features, response vectors, mask vectors, and sample indices or IDs if needed.
+3. Keep DataLoader independent of export logic.
+
+Tests must verify tensor shapes, sample order, masks, dtype, classification, and regression.
+
+### 8.8 `model.py`
+
+Responsibilities:
+
+1. Wrap existing SSDA encoder.
+2. Add multi-output prediction head.
+3. Output `[batch_size, n_drugs]`.
+4. Provide deterministic latent extraction.
+5. Avoid stochastic DAE denoising during export.
+
+Tests must verify output shape, latent shape, deterministic latent export, DAE-like encoder, MLP-like encoder, and no stochastic latent during evaluation/export.
+
+### 8.9 `losses.py`
+
+Responsibilities:
+
+1. Implement masked BCEWithLogitsLoss.
+2. Implement masked MSE.
+3. Implement masked MAE.
+4. Implement masked Huber loss.
+5. Safely handle empty masks.
+
+Required functions:
 
 ```python
-def get_encoder_latent(encoder, x):
-    out = encoder(x)
-    return out[0] if isinstance(out, tuple) else out
+masked_bce_with_logits(logits, targets, mask)
+masked_mse(pred, targets, mask)
+masked_mae(pred, targets, mask)
+masked_huber(pred, targets, mask)
 ```
 
-### 11.4 `prediction.py`
+Tests must verify missing labels ignored, correct averaging, empty mask behavior, gradients, classification, and regression.
 
-- 使用 `model.Test_Double_Model`
-- `confidence = probs[:, 1]`
+### 8.10 `adaptation.py`
 
-### 11.5 `latent_eval.py`
+Responsibilities:
 
-- 自實作 FID/MMD/Wasserstein（numpy）
-- KMeans：`n_clusters = len(unique cancer types)`，**排除** `Unknown`
-- t-SNE：`random_state=seed`；cancer 圖僅當 registry.is_available
+1. Implement masked entropy loss.
+2. Implement masked adentropy/MME-compatible loss if required.
+3. Apply only to `mask_target_unlabeled`.
+4. Support multi-output logits/scores.
+
+Tests must verify masked positions ignored, only target unlabeled positions used, empty masks handled, shape correctness, and documented gradient behavior.
+
+### 8.11 `training.py`
+
+Responsibilities:
+
+1. Train multi-label SSDA model.
+2. Support classification run.
+3. Support regression run.
+4. Use source supervised loss.
+5. Use target labeled supervised loss.
+6. Use target unlabeled adaptation loss.
+7. Ensure validation never updates model.
+8. Save training logs.
+9. Save model checkpoints.
+
+Classification total loss:
+
+```text
+loss_total = source_classification_loss + target_labeled_classification_loss + lambda_adapt * target_unlabeled_adaptation_loss + optional_reconstruction_loss
+```
+
+Regression total loss:
+
+```text
+loss_total = source_regression_loss + target_labeled_classification_loss + lambda_adapt * target_unlabeled_adaptation_loss + optional_reconstruction_loss
+```
+
+Important regression rule:
+
+The model still outputs one score matrix. Source regression interprets scores as continuous predictions. Target classification interprets scores as binary logits.
+
+Tests must verify correct loss calls, inclusion of target labeled loss, inclusion of adaptation loss, no validation backward/optimizer step, training parameter updates, and validation parameter stability.
+
+### 8.12 `prediction.py`
+
+Responsibilities:
+
+1. Predict source outputs.
+2. Predict target outputs.
+3. Convert wide prediction matrix to long result table.
+4. Export only observed sample-drug positions by default.
+5. Include drug ID, drug index, split/role, probability/confidence, and task type.
+
+Tests must verify long table shape, observed-only export, drug IDs, split labels, target roles, sigmoid probability for classification, continuous regression score, and target classification prediction during regression run.
+
+### 8.13 `metrics.py`
+
+Responsibilities:
+
+1. Classification per-drug metrics.
+2. Classification micro/macro/weighted summary metrics.
+3. Regression per-drug metrics.
+4. Regression summary metrics.
+5. Target classification metrics.
+6. Handle drugs with insufficient positive/negative samples.
+
+Classification metrics: AUC, AUPR, accuracy, F1, balanced accuracy.
+
+Regression metrics: RMSE, MAE, R2, Pearson, Spearman.
+
+Tests must verify per-drug metrics, macro/micro/weighted metrics, insufficient class handling, regression correctness, and empty mask safety.
+
+### 8.14 `latent.py`
+
+Responsibilities:
+
+1. Export sample-level source latent.
+2. Export sample-level target latent.
+3. Save pkl dictionaries.
+4. Ensure deterministic encoder output.
+5. Preserve sample IDs.
+
+Output format:
+
+```python
+{"sample_id": [latent_0, latent_1, ..., latent_n]}
+```
+
+Tests must verify all source/target samples exported, sample IDs preserved, latent dimension, and deterministic output.
+
+### 8.15 `latent_eval.py`
+
+Responsibilities:
+
+1. t-SNE domain mixing plot.
+2. t-SNE cancer type plot.
+3. FID.
+4. MMD.
+5. Wasserstein.
+6. KMeans cancer type metrics.
+
+Tests must verify toy-data metric execution, small sample handling, safe t-SNE perplexity, Unknown cancer type handling, and KMeans insufficient-class behavior.
+
+### 8.16 `export.py`
+
+Responsibilities:
+
+1. Create output directories.
+2. Save matrices, masks, drug list, predictions, metrics, latent pkl, plots, config, fold outputs, and summary outputs.
+
+Tests must verify files, CSV schemas, PKL schema, fold paths, and summary paths.
+
+### 8.17 `reports.py`
+
+Responsibilities:
+
+1. Generate data alignment report.
+2. Generate target n-shot summary.
+3. Generate missing data report.
+4. Generate implementation decisions report.
+5. Generate implementation report.
+
+Tests must verify expected report sections, warning counts, and missing source/target/drug cases.
+
+### 8.18 `seed.py`
+
+Responsibilities:
+
+1. Seed Python.
+2. Seed NumPy.
+3. Seed PyTorch.
+4. Seed CUDA when available.
+5. Configure deterministic behavior where practical.
+
+Tests must verify NumPy repeatability, PyTorch CPU repeatability, and no crash without CUDA.
 
 ---
 
-## §12 主 Agent 啟動檢查清單
+## 9. Main Entry Point
 
-開始派工前，主 Agent 自行確認：
+Implement a clear new entry point:
 
-1. [ ] 已讀 `proposal.md`、`design.md`、本 `prompt.md`
-2. [ ] 已記錄 §1.1 保護清單檔案 baseline（hash 或 `git diff` 為空）
-3. [ ] `pyproject.toml` + dev 依賴已安裝；§5.4 exclude 已設定
-4. [ ] `tests/fixtures/` cancer type 已建立
-5. [ ] `preprocess_benchmark.py --drug Gefitinib` 已執行（**不修改**該腳本本體）
-6. [ ] `IMPLEMENTATION_LOG.md` 已建立
-7. [ ] 已存在 `experiment_shot_ssda.py`（copy-first）或列入 P1-3
-8. [ ] Docker 容器 `SSDA` 可 `docker exec`（smoke 用）
+```text
+experiment_multilabel_ssda.py
+```
+
+Prefer this over rewriting existing single-drug entry points.
+
+The entry point must:
+
+1. Parse config.
+2. Set seed.
+3. Load data.
+4. Build drug index.
+5. Build response matrices.
+6. Build masks.
+7. Build source splits.
+8. Build model.
+9. Train fold models.
+10. Export predictions.
+11. Export latent.
+12. Export metrics.
+13. Export reports.
 
 ---
 
-## §13 給下一個 Agent 的單行啟動指令
+## 10. Required Output Structure
 
-```
-你是主 Agent。請嚴格遵守 SSDA4Drug-main/docs/prompt.md（§0 含 0-B 原始碼不可變），
-依 docs/proposal.md 與 docs/design.md 全自動完成 ssda_latent 實作。
-禁止修改 §1.1 保護清單內原始檔；需衍生時先 cp 再改複本（experiment_shot_ssda.py）。
-禁止人工參與、禁止 git commit。gate 僅跑 §5.4 新增程式範圍。
-終局 Docker smoke 使用 experiment_shot_ssda.py。開始 §4 環境準備，然後 P0→P4。
+The implementation must produce:
+
+```text
+save/
+  ssda_multilabel/
+    seed_{random_seed}/
+      config.json
+      drug_list.csv
+      data_alignment_report.csv
+      source_response_matrix.csv
+      source_response_mask.csv
+      target_response_matrix.csv
+      target_observed_mask.csv
+      target_labeled_mask.csv
+      target_unlabeled_mask.csv
+      target_nshot_summary.csv
+      cancer_type_mapping_summary.csv
+
+      fold_0/
+        model_final.pth
+        source_latent_representation.pkl
+        target_latent_representation.pkl
+        source_prediction_results.csv
+        target_prediction_results.csv
+        source_metrics_per_drug.csv
+        source_metrics_summary.csv
+        target_metrics_per_drug.csv
+        target_metrics_summary.csv
+        masked_loss_log.csv
+        latent_distribution_metrics.csv
+        kmeans_cancer_type_metrics.csv
+        tsne_domain_mixing.png
+        tsne_cancer_type.png
+
+      fold_1/
+      fold_2/
+      fold_3/
+      fold_4/
+
+      metrics_summary.csv
+      latent_metrics_summary.csv
+      kmeans_cancer_type_summary.csv
 ```
 
 ---
 
-*本提示詞由使用者 Q0–Q10 確認後定稿；v1.1 新增 PRIORITY 0-B（原始碼不可變、Copy-First）。任何與本檔衝突的口頭指示無效。*
+## 11. Synthetic Toy Dataset Requirement
+
+The implementation must include a synthetic toy dataset test.
+
+The toy dataset must include source omics, target omics, source response long table, target response long table, source-only drug, target-only drug, shared drug, missing labels, insufficient n-shot class samples, and cancer type metadata.
+
+The toy pipeline test must verify end-to-end data preparation, drug union creation, matrix/mask creation, target n-shot masks, one training step, prediction export, latent export, and metrics export.
+
+This test can be lightweight and CPU-only.
+
+---
+
+## 12. Development Workflow
+
+The Main Agent must follow this workflow:
+
+1. Inspect repository.
+2. Locate project root inside Docker.
+3. Read `docs/proposal.md`.
+4. Read `docs/design.md`.
+5. Create `docs/implementation_decisions.md`.
+6. Create task list.
+7. Delegate modules to Sub Agents.
+8. Implement each module with tests.
+9. Run module-level tests after each module.
+10. Integrate modules.
+11. Run full checks.
+12. Fix failures.
+13. Repeat until all checks pass.
+14. Generate `docs/implementation_report.md`.
+
+---
+
+## 13. Required Validation Commands
+
+Run inside Docker only:
+
+```bash
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && ruff check ."
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && ruff format --check ."
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && mypy ."
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && pytest"
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && pytest --cov"
+```
+
+If the project root is different, replace `/workspace/SSDA4Drug` with the detected path.
+
+All final commands and outputs must be recorded in `docs/implementation_report.md`.
+
+---
+
+## 14. Failure Handling
+
+If a check fails:
+
+1. Read the error.
+2. Fix the root cause.
+3. Add a regression test if the failure represents missing coverage.
+4. Re-run the failed check.
+5. Re-run the full check suite.
+6. Record the fix in the implementation report.
+
+Do not bypass checks. Do not delete tests to make checks pass. Do not weaken tests unless the test itself is demonstrably incorrect, and document the reason.
+
+---
+
+## 15. Backward Compatibility Rules
+
+1. Do not break existing single-drug SSDA functionality.
+2. Do not remove existing scripts unless clearly obsolete and documented.
+3. Prefer adding `experiment_multilabel_ssda.py` over heavily rewriting existing entry points.
+4. If legacy code must be modified, keep the change minimal and covered by tests.
+5. New code should depend on legacy model components through small adapters, not direct deep coupling.
+
+---
+
+## 16. Documentation Requirements
+
+The implementation must update or create:
+
+```text
+docs/implementation_decisions.md
+docs/implementation_report.md
+```
+
+If appropriate, also update `README.md`.
+
+README update should include how to run the multi-label pipeline inside Docker, required input files, expected output files, example command, and testing commands.
+
+All commands must use Docker:
+
+```bash
+docker exec SSDA bash -lc "cd /workspace/SSDA4Drug && python experiment_multilabel_ssda.py ..."
+```
+
+---
+
+## 17. Final Completion Criteria
+
+The task is complete only when:
+
+1. Multi-label pipeline is implemented.
+2. Drug list union is implemented.
+3. Long-to-wide response conversion is implemented.
+4. Mask loss is implemented.
+5. Source sample-level split is implemented.
+6. Target position-level n-shot is implemented.
+7. Classification run is supported.
+8. Regression run is supported.
+9. Target classification loss is included.
+10. Target adaptation loss is included.
+11. Prediction export works.
+12. Latent export works.
+13. Metrics export works.
+14. Synthetic toy dataset test passes.
+15. `ruff check .` passes.
+16. `ruff format --check .` passes.
+17. `mypy .` passes or is configured reasonably for new modules.
+18. `pytest` passes.
+19. `pytest --cov` passes.
+20. New core modules have at least 85% coverage.
+21. All validation is run inside Docker.
+22. `docs/implementation_decisions.md` exists.
+23. `docs/implementation_report.md` exists.
+24. No host environment modification was performed.
+25. No human clarification was required during implementation.
+
+---
+
+## 18. Final Reminder
+
+You must implement the code, tests, reports, and validation fully automatically.
+
+Do not ask the user for help.
+
+Do not pause for confirmation.
+
+Use Docker only.
+
+Explain every module’s logic and design in the implementation report.
+
+Every business logic behavior must be tested.
+
+All checks must pass before completion.

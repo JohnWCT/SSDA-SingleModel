@@ -1,53 +1,113 @@
-### Core Python / notebook artifacts (from DAPL-master)
+### Core Python / notebook artifacts
 __pycache__/
 *.py[cod]
+*$py.class
 *.so
 .ipynb_checkpoints/
 
-### Jupyter notebooks (project uses Python scripts instead)
+### Jupyter notebooks (routine use prefers Python scripts)
 *.ipynb
 
-### Virtual environments / local env
+### Virtual environments / secrets
 .env
+.env.*
 .venv/
 env/
 venv/
 ENV/
 
-### Build / packaging / test caches
+### Build / packaging
 build/
 dist/
 *.egg-info/
+*.egg
+
+### ---------------------------------------------------------------------------
+### Test & static-analysis caches (pytest / mypy / ruff / coverage)
+### ---------------------------------------------------------------------------
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
 .coverage
 .coverage.*
+coverage.xml
+*.cover
 htmlcov/
+.pytest_tmp/
+pytest-debug.log
 
-### IDE / editor local configs
-.idea/
-.cursor/
-.vscode/
+# Local pytest output dirs (if --basetemp or tests write under repo)
+tests/output/
+tests/tmp/
+tests/**/__pycache__/
 
-### SSDA4Drug — training outputs (regenerable)
+### ---------------------------------------------------------------------------
+### SSDA4Drug — program run outputs (regenerable; do not commit)
+### experiment_shot.py | experiment_shot_ssda.py | experiment_multilabel_ssda.py
+### ---------------------------------------------------------------------------
 save/
 outputs/
+runs/
+run/
+
+# Single-drug latent pipeline (experiment_shot_ssda)
+save/latent_ssda/
+
+# Multi-label pipeline (experiment_multilabel_ssda)
+save/ssda_multilabel/
+
+# Legacy / default paths from config & trainer
+save/results/
+save/model.pkl
+legacy/
+
+# Per-fold / per-seed run directories (under output roots only)
+save/**/fold_*/
+save/**/seed_*/
+outputs/**/fold_*/
+outputs/**/seed_*/
+runs/**/fold_*/
+runs/**/seed_*/
+
+run.log
+*.log
+
+# Training / eval CSV & JSON under output roots
+save/**/config.json
+save/**/*.csv
+outputs/**/config.json
+outputs/**/*.csv
+runs/**/config.json
+runs/**/*.csv
+
+# Figures from t-SNE / evaluation under output roots
+save/**/tsne_*.png
+save/**/tsne_*.pdf
+save/**/umap_*.png
+outputs/**/tsne_*.png
+outputs/**/tsne_*.pdf
+runs/**/tsne_*.png
 
 ### SSDA4Drug — datasets (regenerable via preprocess_benchmark.py)
 Datasets/rawData/
 Datasets/processedData/
 
-### DAPL-style project outputs
+### Benchmark competing methods — local saves
+Benchmark/**/save/
+
+### DAPL-style / misc project outputs
 data/
 weights/
-outputs/
 result/
 finetune_result/
 data_Winnie/
 output_dir/
 
-### Large model / checkpoint / latent artifacts
+### Large model / checkpoint / latent / array artifacts
 *.pth
 *.pt
 *.ckpt
@@ -59,6 +119,13 @@ output_dir/
 *.joblib
 *.npz
 *.npy
+*.h5
+*.hdf5
+
+### IDE / editor
+.idea/
+.cursor/
+.vscode/
 
 ### Optional: large extended cell-line bundles (uncomment if needed)
 # Extended/
