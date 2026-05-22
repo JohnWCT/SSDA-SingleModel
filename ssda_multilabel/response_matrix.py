@@ -51,11 +51,22 @@ def long_to_response_matrix(
 
     dup = df.duplicated(subset=[sid_col, did_col], keep=False)
     if dup.any():
+        n_dup = int(dup.sum())
         if duplicate_strategy == "error":
             raise ValueError(
-                f"duplicate sample-drug rows in {domain} response ({int(dup.sum())} rows)"
+                f"duplicate sample-drug rows in {domain} response ({n_dup} rows); "
+                "use --duplicate_response_strategy mean|first to collapse"
             )
-        df = df.drop_duplicates(subset=[sid_col, did_col], keep="first")
+        if duplicate_strategy == "first":
+            df = df.drop_duplicates(subset=[sid_col, did_col], keep="first")
+        elif duplicate_strategy == "mean":
+            df = (
+                df.groupby([sid_col, did_col], as_index=False)[resp_col]
+                .mean()
+                .rename(columns={resp_col: resp_col})
+            )
+        else:
+            raise ValueError(f"unknown duplicate_strategy: {duplicate_strategy!r}")
 
     for _, row in df.iterrows():
         sid_key = sample_match_key(row[sid_col], column_hint=resp_hint)

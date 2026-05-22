@@ -65,5 +65,8 @@ class PreparedData:
     folds: tuple[SourceFold, ...]
     source_test_indices: tuple[int, ...]
     cancer_type_df: pd.DataFrame | None
+    cancer_type_summary: pd.DataFrame
+    resolved_source_cancer_type_path: str | None
+    resolved_target_cancer_type_path: str | None
     alignment_report: pd.DataFrame
     nshot_summary: pd.DataFrame

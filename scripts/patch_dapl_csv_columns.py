@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch DAPL CSV columns: PRISM Sample_ID+drug_name; CCLE Sample_ID; TCGA tissue_id."""
+"""Patch DAPL CSV columns: PRISM, GDSC, CCLE Sample_ID; TCGA tissue_id."""
 
 from __future__ import annotations
 
@@ -28,7 +28,21 @@ def patch_prism(prism_path: Path, drug_smiles_path: Path) -> None:
     print(f"Patched {prism_path}: Sample_ID + drug_name ({len(df)} rows)")
 
 
+def patch_gdsc_sample_id(path: Path) -> None:
+    """GDSC response: ModelID (DepMap) -> Sample_ID to match pretrain_ccle."""
+    df = pd.read_csv(path)
+    if "Sample_ID" in df.columns:
+        print(f"Skip {path}: already has Sample_ID")
+        return
+    if "ModelID" not in df.columns:
+        raise ValueError(f"{path} missing ModelID column")
+    df = df.rename(columns={"ModelID": "Sample_ID"})
+    df.to_csv(path, index=False)
+    print(f"Patched {path}: ModelID -> Sample_ID ({len(df)} rows)")
+
+
 def patch_pretrain_sample_id(path: Path) -> None:
+    """CCLE pretrain omics: first column -> Sample_ID."""
     df = pd.read_csv(path)
     first = str(df.columns[0])
     if first == "Sample_ID":
@@ -37,6 +51,18 @@ def patch_pretrain_sample_id(path: Path) -> None:
     df = df.rename(columns={first: "Sample_ID"})
     df.to_csv(path, index=False)
     print(f"Patched {path}: renamed {first!r} -> Sample_ID ({len(df)} rows)")
+
+
+def patch_pretrain_tissue_id(path: Path) -> None:
+    """TCGA pretrain omics: first column -> tissue_id."""
+    df = pd.read_csv(path)
+    first = str(df.columns[0])
+    if first == TARGET_OMICS_SAMPLE_ID_COL:
+        print(f"Skip {path}: already has {TARGET_OMICS_SAMPLE_ID_COL}")
+        return
+    df = df.rename(columns={first: TARGET_OMICS_SAMPLE_ID_COL})
+    df.to_csv(path, index=False)
+    print(f"Patched {path}: renamed {first!r} -> {TARGET_OMICS_SAMPLE_ID_COL} ({len(df)} rows)")
 
 
 def patch_tcga_tissue_id(path: Path, *, normalize_values: bool, chunksize: int = 50_000) -> None:
@@ -76,10 +102,14 @@ def main() -> None:
         root / "data_Winnie/drug_smiles.csv",
     )
     patch_pretrain_sample_id(root / "data/pretrain_ccle.csv")
-    patch_tcga_tissue_id(
-        root / "data/TCGA/pretrain_tcga.csv",
-        normalize_values=False,
+    patch_gdsc_sample_id(root / "data/GDSC2_fitted_dose_response_MaxScreen_raw.csv")
+    legacy_gdsc = (
+        root
+        / "data/GDSC2_fitted_dose_response_27Oct23 from GDSC MaxScreen threshold ModelID966 drug230 samples201288.csv"
     )
+    if legacy_gdsc.is_file():
+        patch_gdsc_sample_id(legacy_gdsc)
+    patch_pretrain_tissue_id(root / "data/TCGA/pretrain_tcga.csv")
     patch_tcga_tissue_id(
         root / "data_Winnie/TCGA_impact_hotspot.csv",
         normalize_values=True,

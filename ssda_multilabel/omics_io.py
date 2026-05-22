@@ -21,14 +21,27 @@ def _resolve_col(df: pd.DataFrame, col: str) -> str:
     raise ValueError(f"column {col!r} not found in {list(df.columns)}")
 
 
-def resolve_target_omics_sample_id_col(columns: list[str]) -> str:
-    """Target omics must expose ``tissue_id`` (TCGA 4-segment tissue barcode)."""
+def resolve_source_omics_sample_id_col(columns: list[str]) -> str:
+    """Source omics ID: ``Sample_ID`` or pretrain ``Unnamed: 0`` (ACH-*)."""
     lookup = {str(c).lower(): str(c) for c in columns}
-    key = TARGET_OMICS_SAMPLE_ID_COL.lower()
-    if key in lookup:
-        return lookup[key]
+    for want in (SOURCE_OMICS_SAMPLE_ID_COL.lower(), "unnamed: 0"):
+        if want in lookup:
+            return lookup[want]
+    if columns:
+        return str(columns[0])
+    raise ValueError("source omics table has no columns")
+
+
+def resolve_target_omics_sample_id_col(columns: list[str]) -> str:
+    """Target omics ID: ``tissue_id`` or pretrain ``Unnamed: 0`` (TCGA tissue barcode)."""
+    lookup = {str(c).lower(): str(c) for c in columns}
+    for want in (TARGET_OMICS_SAMPLE_ID_COL.lower(), "unnamed: 0"):
+        if want in lookup:
+            return lookup[want]
+    if columns:
+        return str(columns[0])
     raise ValueError(
-        f"target omics requires {TARGET_OMICS_SAMPLE_ID_COL!r} column; got {list(columns)}"
+        f"target omics requires {TARGET_OMICS_SAMPLE_ID_COL!r} or index column; got {list(columns)}"
     )
 
 

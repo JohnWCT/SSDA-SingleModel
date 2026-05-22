@@ -41,7 +41,7 @@ class MultiLabelConfig:
     batch_size: int
     dropout: float
     device: str
-    duplicate_response_strategy: Literal["error", "first"]
+    duplicate_response_strategy: Literal["error", "first", "mean"]
     exclude_unknown_cancer_type_for_kmeans: bool
     adapt_eta: float = 0.1
 
@@ -62,7 +62,8 @@ def resolve_multilabel_output_dir(
     latent_output_dir: str | None = None,
 ) -> tuple[str, str]:
     root = Path(output_dir)
-    resolved = str(latent_output_dir or (root / DEFAULT_MULTILABEL_SUBDIR))
+    # Default: write directly under --output_dir (no ssda_multilabel/seed_* nesting).
+    resolved = str(latent_output_dir or root)
     return str(root), resolved
 
 
@@ -86,12 +87,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--source_cancer_type_path", default=None)
     p.add_argument("--target_cancer_type_path", default=None)
-    p.add_argument("--cancer_type_col", default="cancer_type")
+    p.add_argument(
+        "--cancer_type_col",
+        default="Cancer_type",
+        help="Used only when custom cancer-type CSV is passed; DAPL auto paths use built-in columns",
+    )
     p.add_argument("--random_seed", type=int, default=42)
     p.add_argument("--source_test_size", type=float, default=0.1)
     p.add_argument("--n_splits", type=int, default=5)
     p.add_argument("--n_shot", type=int, default=3)
-    p.add_argument("--reg_loss", choices=["mse", "mae", "huber"], default="mse")
+    p.add_argument(
+        "--reg_loss",
+        choices=["mse", "mae", "huber"],
+        default="mae",
+        help="Source regression loss for training/validation (default: mae)",
+    )
     p.add_argument("--lambda_adapt", type=float, default=0.1)
     p.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
     p.add_argument("--latent_output_dir", type=str, default=None)
@@ -102,7 +112,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu")
-    p.add_argument("--duplicate_response_strategy", choices=["error", "first"], default="error")
+    p.add_argument(
+        "--duplicate_response_strategy",
+        choices=["error", "first", "mean"],
+        default="mean",
+        help="Collapse duplicate (sample, drug) rows: mean (default), first, or error",
+    )
     p.add_argument("--exclude_unknown_cancer_type_for_kmeans", action="store_true")
     p.add_argument("--adapt_eta", type=float, default=0.1)
 

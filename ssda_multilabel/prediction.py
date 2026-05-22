@@ -49,13 +49,14 @@ def build_prediction_long_table(
                 continue
             did = drug_index.index_to_drug[j]
             score = float(scores[i, j])
-            prob = 1.0 / (1.0 + np.exp(-score)) if task_type == "classification" else float("nan")
+            clipped = float(np.clip(score, -50.0, 50.0))
+            prob = float(1.0 / (1.0 + np.exp(-clipped)))
             if task_type == "classification":
                 pred_label = int(prob >= 0.5)
                 confidence = prob
             else:
-                pred_label = int(score >= 1.0)
-                confidence = prob
+                pred_label = int(prob >= 0.5)
+                confidence = score
             row: dict[str, object] = {
                 "sample_id": sid,
                 "drug_id": did,

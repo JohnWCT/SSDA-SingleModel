@@ -146,6 +146,22 @@ docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug; pip install pytest mypy ruff
 | Target response | `Patient_id` + `Label`（join 時將 `tissue_id` 轉為三段位 patient key） |
 | 藥物 | `drug_name`（PRISM 請先執行 `PYTHONPATH=. python3 scripts/patch_dapl_csv_columns.py`） |
 
+**Cancer type（可不傳 CLI）**：依 omics 路徑自動選擇 DAPL 表（見下表）；不另輸出 cancer type 摘要 CSV。
+
+| 設定 | Source | Target |
+|------|--------|--------|
+| pretrain（`pretrain_ccle` + `pretrain_tcga`） | `data/ccle_sample_info_df.csv` | `data/TCGA/xena_sample_info_df.csv` |
+| Winnie impact（`CCLE_impact_hotspot` + `TCGA_impact_hotspot`） | `data_Winnie/CCLE_cancer_type.csv` | `data_Winnie/TCGA_cancer_type.csv` |
+
+手動覆寫時才需 `--source_cancer_type_path` / `--target_cancer_type_path`。
+
+輸出指標（`source/target_metrics_per_drug.csv` 與 `*_summary.csv`）：
+
+| `--task_type` | 訓練收斂 loss | 評估欄位 |
+|---------------|---------------|----------|
+| `regression` | source 用 `--reg_loss`（預設 **MAE**） | **source**：MAE, RMSE, R2, Pearson, Spearman；**target**：AUC, AUPR, Accuracy, F1, Precision, Recall, Balanced Accuracy |
+| `classification` | masked BCE | source / target 皆為分類指標（同上）；target 含所有有 label 的樣本（含 n-shot） |
+
 DAPL 範例（掛載 `DAPL-master` 後）：
 
 ```bash
@@ -162,6 +178,26 @@ docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug && python experiment_multilab
   --output_dir outputs'
 ```
 
+Classification smoke test（2 folds × 1 epoch）：
+
+```bash
+docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug-main && python experiment_multilabel_ssda.py --smoke_test classification'
+```
+
+正式 classification（`GDSC2_fitted_dose_response_MaxScreen_raw.csv` + pretrain omics；cancer type 取自 `ccle_sample_info_df` / `xena_sample_info_df` 的 `cancer_type` 欄）：
+
+```bash
+docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug-main && python experiment_multilabel_ssda.py \
+  --task_type classification \
+  --source_omics_path /workspace/DAPL-master/data/pretrain_ccle.csv \
+  --target_omics_path /workspace/DAPL-master/data/TCGA/pretrain_tcga.csv \
+  --source_response_path /workspace/DAPL-master/data/GDSC2_fitted_dose_response_MaxScreen_raw.csv \
+  --target_response_path /workspace/DAPL-master/data/TCGA/PMID27354694_DR_OMICS_ad_intersect_pretrain.csv \
+  --source_response_col Label \
+  --random_seed 42 --n_splits 5 --n_shot 3 --epochs 50 \
+  --output_dir outputs_classification'
+```
+
 Docker 範例（processedData 路徑，請替換 response）：
 
 ```bash
@@ -175,7 +211,7 @@ docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug && python experiment_multilab
   --output_dir outputs'
 ```
 
-預設寫入 `outputs/ssda_multilabel/seed_<seed>/`；可用 `--output_dir outputs` 指定根目錄，或以 `--latent_output_dir` 覆寫完整子路徑。設計說明見 `docs/proposal.md`、`docs/design.md`；實作報告見 `docs/implementation_report.md`。
+預設寫入 `--output_dir` 目錄本身（例如 `outputs_smoke_classification/fold_0/`），不再巢狀 `ssda_multilabel/seed_*`。可用 `--latent_output_dir` 覆寫完整輸出路徑。設計說明見 `docs/proposal.md`、`docs/design.md`；實作報告見 `docs/implementation_report.md`。
 
 測試（容器內）：
 

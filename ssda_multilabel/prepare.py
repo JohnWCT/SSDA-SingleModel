@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pandas as pd
 
-from ssda_multilabel.cancer_type import load_and_align_cancer_types
+from ssda_multilabel.cancer_type import (
+    infer_dapl_root,
+    load_and_align_cancer_types,
+    resolve_cancer_type_paths,
+)
 from ssda_multilabel.config import MultiLabelConfig
 from ssda_multilabel.drug_index import build_drug_index_from_union
 from ssda_multilabel.drug_normalize import normalize_drug_name_column
@@ -13,6 +17,7 @@ from ssda_multilabel.omics_io import (
     align_omics_features,
     read_omics_table,
     read_response_long,
+    resolve_source_omics_sample_id_col,
     resolve_target_omics_sample_id_col,
 )
 from ssda_multilabel.reports import build_nshot_summary
@@ -43,12 +48,14 @@ def _prepare_response_df(path: str) -> pd.DataFrame:
 
 
 def prepare_multilabel_data(config: MultiLabelConfig) -> PreparedData:
+    src_cols = pd.read_csv(config.source_omics_path, nrows=0).columns.tolist()
     tgt_cols = pd.read_csv(config.target_omics_path, nrows=0).columns.tolist()
+    source_omics_sid = resolve_source_omics_sample_id_col(src_cols)
     target_omics_sid = resolve_target_omics_sample_id_col(tgt_cols)
 
     src_omics_df = read_omics_table(
         config.source_omics_path,
-        SOURCE_OMICS_SAMPLE_ID_COL,
+        source_omics_sid,
         "source",
     )
     tgt_omics_df = read_omics_table(
@@ -72,7 +79,7 @@ def prepare_multilabel_data(config: MultiLabelConfig) -> PreparedData:
         config.source_response_col,
         "source",
         config.duplicate_response_strategy,
-        omics_sample_id_col=SOURCE_OMICS_SAMPLE_ID_COL,
+        omics_sample_id_col=source_omics_sid,
         response_sample_id_col=SOURCE_RESPONSE_SAMPLE_ID_COL,
     )
     target_response = long_to_response_matrix(
@@ -101,11 +108,21 @@ def prepare_multilabel_data(config: MultiLabelConfig) -> PreparedData:
         config.n_splits,
         config.random_seed,
     )
+    src_ct_path = config.source_cancer_type_path
+    tgt_ct_path = config.target_cancer_type_path
+    if src_ct_path is None or tgt_ct_path is None:
+        auto_src, auto_tgt = resolve_cancer_type_paths(
+            config.source_omics_path,
+            config.target_omics_path,
+            infer_dapl_root(config.source_omics_path, config.target_omics_path),
+        )
+        src_ct_path = src_ct_path or auto_src
+        tgt_ct_path = tgt_ct_path or auto_tgt
     cancer_df, cancer_summary = load_and_align_cancer_types(
         list(source_omics.sample_ids),
         list(target_omics.sample_ids),
-        config.source_cancer_type_path,
-        config.target_cancer_type_path,
+        src_ct_path,
+        tgt_ct_path,
         SOURCE_OMICS_SAMPLE_ID_COL,
         config.cancer_type_col,
     )
@@ -116,7 +133,7 @@ def prepare_multilabel_data(config: MultiLabelConfig) -> PreparedData:
             {
                 "metric": describe_sample_id_column(
                     list(source_omics.sample_ids)[:200],
-                    SOURCE_OMICS_SAMPLE_ID_COL,
+                    source_omics_sid,
                 )
             },
             {
@@ -151,6 +168,9 @@ def prepare_multilabel_data(config: MultiLabelConfig) -> PreparedData:
         folds=folds,
         source_test_indices=test_idx,
         cancer_type_df=cancer_df,
+        cancer_type_summary=cancer_summary,
+        resolved_source_cancer_type_path=src_ct_path,
+        resolved_target_cancer_type_path=tgt_ct_path,
         alignment_report=alignment_report,
         nshot_summary=nshot_summary,
     )

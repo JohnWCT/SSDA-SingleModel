@@ -1,5 +1,7 @@
 # Proposal: Convert SSDA-SingleModel to Multi-label / Multi-drug SSDA Framework
 
+> **實作已完成階段：** 多藥入口為 `experiment_multilabel_ssda.py`。若要從 `experiment_shot.py` 改寫或對照實作，請優先閱讀 **§26** 與 `docs/design.md` **§14**（As-Built + 遷移指南）。架構細節見 `design.md`；本文件 §2、§19–§22、§26 已同步 2025-05 實作。
+
 ## 1. Project Goal
 
 本 proposal 目標是修改目前的：
@@ -59,6 +61,15 @@ omics data table
 | target drug 不存在 | 若 target 沒有該 drug label，該 drug 的 target n-shot 直接跳過並記錄 |
 | target unlabeled | target 中有觀測 label 但未被抽為 n-shot labeled 的 positions |
 | latent pkl | 維持 sample-level latent pkl，不是 sample-drug-level latent |
+| **DAPL 欄位（程式寫死，不需 CLI）** | 見 §26.2；omics/response join 規則見 `ssda_multilabel/sample_id.py` |
+| **輸出根目錄** | 預設直接寫入 `--output_dir`（例如 `outputs_smoke_classification/`），**不再**巢狀 `ssda_multilabel/seed_*` |
+| **latent pkl 涵蓋範圍** | **完整** source/target omics 表（非 val-only）；split 僅標在 prediction CSV |
+| **target 評估範圍** | 所有 `mask=1` 的 target sample-drug positions（含 n-shot labeled） |
+| **source 評估範圍** | 僅 `split == source_test`（每 fold 固定 test set） |
+| **regression run 的 target 指標** | 仍用 **分類** 指標（target 標籤恒為 0/1） |
+| **duplicate (sample, drug)** | 預設 `--duplicate_response_strategy mean`（PRISM 同藥名多 broad_id） |
+| **reg_loss 預設** | `mae`（非 proposal 初稿的 mse） |
+| **cancer type** | 依 omics 路徑自動選 DAPL 表；不需手動 `--source_cancer_type_path`（pretrain / Winnie 各一套） |
 
 ---
 
@@ -68,7 +79,7 @@ omics data table
 
 本次修改包含：
 
-1. 將 `experiment_shot_ssda.py` 改為 multi-label / multi-drug 任務入口。
+1. 新增 `experiment_multilabel_ssda.py` 作為 multi-label / multi-drug 任務入口（保留原版 `experiment_shot.py` 單藥流程）。
 2. 新增資料整理模組，將 source / target long response table 轉成 wide matrix + mask tensor。
 3. 新增 `drug_list.csv` 生成與讀取邏輯。
 4. 新增 multi-output prediction head。
@@ -116,16 +127,19 @@ source_omics.csv
 target_omics.csv
 ```
 
-範例：
+範例（DAPL As-Built）：
 
-| Sample_ID | gene_1 | gene_2 | gene_3 | ... |
-|---|---:|---:|---:|---:|
-| S1 | 0.12 | 0.45 | 0.78 | ... |
-| S2 | 0.33 | 0.21 | 0.44 | ... |
+| Source: `Sample_ID` | gene_1 | ... |
+|---|---:|---:|
+| ACH-000001 | 0.12 | ... |
+
+| Target: `tissue_id` | gene_1 | ... |
+|---|---:|---:|
+| TCGA-AA-3695-01A | 0.33 | ... |
 
 需求：
 
-1. 第一欄或指定欄位為 sample ID。
+1. Source 使用 `Sample_ID`；Target 使用 `tissue_id`（pretrain 舊檔可用 `patch_dapl_csv_columns.py` 將第一欄改名）。
 2. 其餘欄位為 numeric omics features。
 3. source / target feature 必須對齊。
 4. 若 source / target feature 不完全相同，應取共同 features，並記錄被移除的 features。
@@ -141,19 +155,17 @@ source response 使用 long table 作為標準輸入。
 source_response.csv
 ```
 
-建議欄位：
+建議欄位（DAPL As-Built）：
 
 | 欄位 | 說明 |
 |---|---|
-| sample_id | source sample ID |
-| drug_id | drug ID |
-| response | response value |
-| cancer_type | optional |
-| original_drug_name | optional |
+| `Sample_ID` | source sample ID（固定） |
+| `drug_name` | drug 名稱（union 鍵） |
+| `Label` 或 `--source_response_col` | GDSC 用 `Label`；PRISM 用 `neg_log2_auc` |
 
-classification task 時，`response` 應為 0/1。
+classification：`--source_response_col Label`（0/1）。
 
-regression task 時，`response` 應為 continuous value，例如 `neg_log2_auc`。
+regression：`--source_response_col neg_log2_auc`（連續值）。
 
 ---
 
@@ -165,15 +177,15 @@ target response 也使用 long table 作為標準輸入。
 target_response.csv
 ```
 
-建議欄位：
+建議欄位（DAPL As-Built）：
 
 | 欄位 | 說明 |
 |---|---|
-| sample_id | target sample ID |
-| drug_id | drug ID |
-| response | binary 0/1 target response |
-| cancer_type | optional |
-| original_drug_name | optional |
+| `Patient_id` | TCGA 三段 patient key（固定） |
+| `drug_name` | drug 名稱 |
+| `Label` | binary 0/1（程式固定 `target_response_col=Label`） |
+
+Target omics 用 `tissue_id`（四段）經 `tcga_patient_key` join 到 `Patient_id`。
 
 target response 在本專案中一律視為 classification label。
 
@@ -258,18 +270,10 @@ target_cancer_type.csv
 
 需要新增一個專門的資料整理模組。
 
-建議新增：
+已實作於：
 
 ```text
-ssda_multilabel/
-  prepare_multilabel_data.py
-```
-
-或放在現有 package 內：
-
-```text
-ssda_latent/
-  multilabel_data.py
+ssda_multilabel/prepare.py   # prepare_multilabel_data(config)
 ```
 
 ### 5.1 Responsibilities
@@ -971,109 +975,120 @@ Alternative: place these under existing `ssda_latent/` if the project prefers fe
 
 ---
 
-## 19. Suggested Output Structure
+## 19. Output Structure（As-Built，2025-05）
+
+輸出根目錄 = `--output_dir`（或 `--latent_output_dir` 若明確指定）。**不再**建立 `ssda_multilabel/seed_{seed}/` 子目錄；`random_seed` 僅寫入 `config.json` 與 prediction 列。
 
 ```text
-save/
-  ssda_multilabel/
-    seed_{random_seed}/
-      config.json
-      drug_list.csv
-      data_alignment_report.csv
-      source_response_matrix.csv
-      source_response_mask.csv
-      target_response_matrix.csv
-      target_observed_mask.csv
-      target_labeled_mask.csv
-      target_unlabeled_mask.csv
-      target_nshot_summary.csv
-      cancer_type_mapping_summary.csv
+{output_dir}/
+  config.json
+  drug_list.csv
+  data_alignment_report.csv
 
-      fold_0/
-        model_final.pth
-        source_latent_representation.pkl
-        target_latent_representation.pkl
-        source_prediction_results.csv
-        target_prediction_results.csv
-        source_metrics_per_drug.csv
-        source_metrics_summary.csv
-        target_metrics_per_drug.csv
-        target_metrics_summary.csv
-        masked_loss_log.csv
-        latent_distribution_metrics.csv
-        kmeans_cancer_type_metrics.csv
-        tsne_domain_mixing.png
-        tsne_cancer_type.png
+  fold_0/
+    model_final.pth
+    masked_loss_log.csv
+    source_latent_representation.pkl    # 完整 source omics 全樣本
+    target_latent_representation.pkl    # 完整 target omics 全樣本
+    source_prediction_results.csv
+    target_prediction_results.csv
+    source_metrics_per_drug.csv         # 僅 source_test
+    source_metrics_summary.csv
+    target_metrics_per_drug.csv
+    target_metrics_summary.csv
+    latent_distribution_metrics.csv
+    kmeans_cancer_type_metrics.csv
+    tsne_domain_mixing.png
+    tsne_cancer_type.png
 
-      fold_1/
-        ...
+  fold_1/
+    ...
 
-      fold_2/
-        ...
-
-      fold_3/
-        ...
-
-      fold_4/
-        ...
-
-      metrics_summary.csv
-      latent_metrics_summary.csv
-      kmeans_cancer_type_summary.csv
+  source_test_metrics_summary_across_folds.csv
+  source_test_metrics_summary_fold_mean_std.csv
+  source_test_metrics_per_drug_fold_mean_std.csv
+  target_eval_metrics_summary_across_folds.csv
+  target_eval_metrics_summary_fold_mean_std.csv
+  target_eval_metrics_per_drug_fold_mean_std.csv
+  latent_metrics_summary.csv
+  kmeans_cancer_type_summary.csv
+  kmeans_cancer_type_fold_mean_std.csv
 ```
+
+### 19.1 刻意不輸出的檔案
+
+以下僅在記憶體／`PreparedData` 內使用，**不寫入磁碟**（減少 I/O 與磁碟占用）：
+
+- `source_response_matrix.csv` / `target_response_matrix.csv`
+- 各種 `*_mask.csv`
+- `target_nshot_summary.csv`
+- `cancer_type_mapping_summary.csv` / `cancer_type_paths_used.csv`
 
 ---
 
-## 20. CLI Arguments
+## 20. CLI Arguments（As-Built）
 
-Suggested CLI arguments:
+入口：`experiment_multilabel_ssda.py`（`ssda_multilabel.config.build_arg_parser`）。
+
+### 20.1 必填
 
 ```bash
---task_type classification
---task_type regression
-
+--task_type classification   # 或 regression
 --source_omics_path
 --target_omics_path
 --source_response_path
 --target_response_path
+--source_response_col          # classification: Label (GDSC)；regression: neg_log2_auc (PRISM)
+```
 
---sample_id_col Sample_ID
---drug_id_col drug_id
---response_col response
+**不提供的 CLI（程式寫死）：**
 
---source_cancer_type_path
---target_cancer_type_path
---cancer_type_col cancer_type
+| 用途 | 固定欄位 |
+|------|----------|
+| Source omics ID | `Sample_ID`（或 pretrain 第一欄 `Unnamed: 0`） |
+| Target omics ID | `tissue_id`（四段 TCGA，或 pretrain `Unnamed: 0`） |
+| Source response sample | `Sample_ID` |
+| Target response sample | `Patient_id` |
+| Target response label | `Label` |
+| Drug | `drug_name` |
 
+`--sample_id_col` / `--response_col` 僅 SUPPRESS 相容舊腳本，新流程勿用。
+
+### 20.2 常用可選
+
+```bash
 --random_seed 42
 --source_test_size 0.1
 --n_splits 5
 --n_shot 3
-
---reg_loss mse
+--reg_loss mae              # 預設 mae
 --lambda_adapt 0.1
---latent_output_dir save/ssda_multilabel
+--duplicate_response_strategy mean
+--output_dir outputs
+--latent_output_dir         # 預設 = output_dir（扁平目錄）
+--encoder mlp               # 或 dae
+--encoder_h_dims 512,256
+--epochs 50
+--lr 1e-3
+--batch_size 32
+--device cuda
 ```
 
-Retain relevant original SSDA arguments:
+Cancer type：**預設自動**；僅在自訂表時傳 `--source_cancer_type_path` / `--target_cancer_type_path`（`--cancer_type_col` 預設 `Cancer_type`）。
+
+### 20.3 Smoke（Docker 驗證用）
 
 ```bash
---encoder
---encoder_h_dims
---epochs
---lr
---batch_size
---result
---sc_all
+cd /workspace/SSDA4Drug-main
+PYTHONPATH=. python experiment_multilabel_ssda.py --smoke_test classification
+PYTHONPATH=. python experiment_multilabel_ssda.py --smoke_test regression
 ```
 
-Remove or avoid drug-specific single-task arguments if no longer applicable:
+內建路徑見 `experiment_multilabel_ssda.py` 的 `SMOKE_CLASSIFICATION_ARGS` / `SMOKE_REGRESSION_ARGS`（DAPL 掛載 `/workspace/DAPL-master`）。
 
-```bash
---drug
-```
+### 20.4 單藥版勿再使用的參數
 
-If `--drug` must be retained for backward compatibility, it should not control model output dimension in multi-label mode.
+`experiment_shot.py` 的 `--drug`、`--method`、`--gene`、`./Datasets/processedData/{drug}/` **不**套用到 multi-label 入口；藥物維度由 `drug_list.csv`（source ∪ target `drug_name`）決定。
 
 ---
 
@@ -1147,6 +1162,28 @@ If `--drug` must be retained for backward compatibility, it should not control m
 ---
 
 ## 22. Testing and Validation
+
+### 22.0 實作驗證節點（2025-05 已跑通）
+
+| 節點 | 指令 / 檢查 | 通過標準 |
+|------|-------------|----------|
+| **P0 資料欄位** | `PYTHONPATH=. python scripts/patch_dapl_csv_columns.py --dapl-root /workspace/DAPL-master` | `pretrain_tcga.csv` 第一欄為 `tissue_id`；GDSC/PRISM 有 `Sample_ID` + `drug_name` |
+| **P1 Smoke classification** | `python experiment_multilabel_ssda.py --smoke_test classification`（Docker `SSDA`） | exit 0；輸出在 `outputs_smoke_classification/`（無 `seed_42` 子目錄） |
+| **P2 Smoke regression** | `--smoke_test regression` | 同上 → `outputs_smoke_regression/` |
+| **P3 對齊報告** | `data_alignment_report.csv` | `n_source_samples` / `n_target_samples` 與 omics 列數一致；TCGA join 說明含 `tissue_id -> Patient_id` |
+| **P4 Source 指標** | `source_metrics_*.csv` | 僅來自 `split==source_test`（非全 source train+val+test） |
+| **P5 Target 指標** | `target_metrics_*.csv` | 含所有 observed target positions；regression run 仍為 AUC/F1 等分類指標 |
+| **P6 Latent** | `*_latent_representation.pkl` key 數 | = 完整 omics 樣本數（1128 / 8969 等），非 val 子集 |
+| **P7 視覺化** | `kmeans_cancer_type_summary.csv` | ARI/NMI 非全 0；`tsne_cancer_type.png` 非全 Unknown |
+| **P8 靜態檢查** | `ruff` / `mypy` / `pytest tests/test_multilabel_*.py` | 容器內通過（見 `docs/implementation_report.md`） |
+
+**常見失敗與修復（心得）：**
+
+1. PRISM 同 `(Sample_ID, drug_name)` 多列 → `--duplicate_response_strategy mean`。
+2. regression 時 target `probability=NaN` 導致 AUPR 崩潰 → `metrics._classification_scores` 回退 `pred_score`。
+3. `metrics.py` 內 `del domain` 誤刪區域變數 → 改為不 shadow 參數名。
+4. KMeans/t-SNE 全 Unknown → 確認未手動關閉 cancer type 自動解析；pretrain 用 `ccle_sample_info_df` / `xena_sample_info_df` 的 `cancer_type` 欄。
+5. Docker 路徑 → 專案目錄 `/workspace/SSDA4Drug-main`（舊名 `SSDA4Drug` 需 symlink 或 `-w`）。
 
 ### 22.1 Data Alignment Tests
 
@@ -1259,10 +1296,170 @@ This project is complete when:
 
 These can be implemented as config / CLI options rather than fixed assumptions:
 
-1. `--reg_loss`: `mse`, `mae`, or `huber`.
-2. `--exclude_unknown_cancer_type_for_kmeans`: true / false.
-3. `--source_test_size`: default 0.1.
-4. `--n_splits`: default 5.
-5. `--n_shot`: target n-shot per drug per class.
-6. `--lambda_adapt`: target adaptation loss weight.
-7. Whether to export wide prediction matrix in addition to long prediction table.
+1. `--reg_loss`: `mse`, `mae`, or `huber`（**已實作，預設 mae**）。
+2. `--exclude_unknown_cancer_type_for_kmeans`: true / false（**已實作**）。
+3. `--source_test_size`: default 0.1（**已實作**）。
+4. `--n_splits`: default 5（**已實作**）。
+5. `--n_shot`: target n-shot per drug per class（**已實作**）。
+6. `--lambda_adapt`: target adaptation loss weight（**已實作**）。
+7. Whether to export wide prediction matrix in addition to long prediction table（**目前僅 long table**）。
+
+---
+
+## 26. As-Built 實作紀錄與 `experiment_shot.py` → `experiment_multilabel_ssda.py` 遷移指南
+
+> **用途：** 僅閱讀本節 + `docs/design.md` §14，應能從頭改寫或對照 `experiment_multilabel_ssda.py`，而不必回溯聊天紀錄。
+
+### 26.1 舊版 `experiment_shot.py` vs 新版入口
+
+| 面向 | `experiment_shot.py`（單藥） | `experiment_multilabel_ssda.py`（多藥） |
+|------|---------------------------|--------------------------------------|
+| 資料根目錄 | `./Datasets/processedData/{drug}/` | CLI 四個 CSV 路徑（通常 DAPL-master） |
+| 藥物維度 | `--drug` 迴圈 50 次 | `drug_list.csv` = sorted(source ∪ target `drug_name`) |
+| Omics | `source_scaled{gene}.csv` 轉置後 split | `read_omics_table` + `align_omics_features`（共同 feature） |
+| Response | `source_meta_data.csv` 單欄 `response` | long table → wide `[n_samples, n_drugs]` + mask |
+| Target | 同 drug 的 target 資料（單藥管線） | 獨立 target omics + response；position-level n-shot |
+| Split | `train_test_split` 0.2 做 val | sample-level **固定 test** + K-fold train/val |
+| 取樣 | `WeightedRandomSampler` 類別平衡 | `MultiLabelSampleDataset` 逐 sample；mask 決定有效 label |
+| 模型 | legacy `model.py` + `trainer.py` | `ssda_multilabel.model.MultiLabelSSDAModel` |
+| Head 輸出 | 單輸出 logit | `[batch, n_drugs]` multi-output |
+| Val | 舊 trainer 可能更新參數 | `MultiLabelSSDTrainer`：**val 僅 forward** |
+| Latent | 單藥、單 domain 習慣 | 每 fold 輸出 **完整** source/target sample-level pkl |
+| 輸出目錄 | 依 `para` 字串散落 | `--output_dir` 扁平 + `fold_{k}/` |
+
+**遷移原則：** 不要把 `experiment_shot.py` 內聯改寫；改為薄入口 + `ssda_multilabel/*` 模組，保留 `experiment_shot.py` 給舊實驗。
+
+### 26.2 DAPL 固定欄位與 Join（`sample_id.py`）
+
+```text
+Source omics / source response sample key:  Sample_ID  (ACH-*, CCLE)
+Target omics sample key:                    tissue_id    (TCGA 四段，例 TCGA-AA-3695-01A)
+Target response sample key:                   Patient_id   (TCGA 三段，例 TCGA-AA-3695)
+Target response label:                        Label        (0/1，程式寫死 target_response_col)
+Drug:                                         drug_name
+```
+
+**Target join：** `sample_match_key(tissue_id)` → `tcga_patient_key`（三段）再對齊 `Patient_id`。
+
+**資料前處理腳本：** `scripts/patch_dapl_csv_columns.py`
+
+- PRISM：`depmap_id` → `Sample_ID`，補 `drug_name`
+- pretrain CCLE：第一欄 → `Sample_ID`
+- pretrain TCGA：第一欄 → `tissue_id`
+- GDSC：`ModelID` → `Sample_ID`（若缺）
+- Winnie TCGA impact：正規化為四段 `tissue_id`
+
+### 26.3 正式資料路徑（DAPL，與 smoke 一致）
+
+**Classification**
+
+```text
+source_omics:   DAPL-master/data/pretrain_ccle.csv
+target_omics:   DAPL-master/data/TCGA/pretrain_tcga.csv
+source_response: DAPL-master/data/GDSC2_fitted_dose_response_MaxScreen_raw.csv  (--source_response_col Label)
+target_response: DAPL-master/data/TCGA/PMID27354694_DR_OMICS_ad_intersect_pretrain.csv
+```
+
+> 舊檔 `GDSC2_fitted_dose_response_27Oct23 from GDSC MaxScreen threshold ...csv` 請改用上列 `*_MaxScreen_raw.csv`（`patch_dapl_csv_columns.py` 亦會處理兩者）。
+
+**Classification 正式指令（Docker `SSDA`）**
+
+```bash
+# 一次性：標準化 DAPL 欄位（Sample_ID / tissue_id / drug_name）
+docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug-main && PYTHONPATH=. python scripts/patch_dapl_csv_columns.py --dapl-root /workspace/DAPL-master'
+
+docker exec SSDA bash -lc 'cd /workspace/SSDA4Drug-main && PYTHONPATH=. python experiment_multilabel_ssda.py \
+  --task_type classification \
+  --source_omics_path /workspace/DAPL-master/data/pretrain_ccle.csv \
+  --target_omics_path /workspace/DAPL-master/data/TCGA/pretrain_tcga.csv \
+  --source_response_path /workspace/DAPL-master/data/GDSC2_fitted_dose_response_MaxScreen_raw.csv \
+  --target_response_path /workspace/DAPL-master/data/TCGA/PMID27354694_DR_OMICS_ad_intersect_pretrain.csv \
+  --source_response_col Label \
+  --random_seed 42 --n_splits 5 --n_shot 3 --epochs 50 \
+  --output_dir outputs_classification'
+```
+
+輸出目錄：`outputs_classification/`（扁平，直接含 `fold_0/`…，無 `ssda_multilabel/seed_42/`）。
+
+**Regression（Winnie impact + PRISM）**
+
+```text
+source_omics:   data_Winnie/CCLE_impact_hotspot.csv
+target_omics:   data_Winnie/TCGA_impact_hotspot.csv
+source_response: data_Winnie/PRISM_drug_sensitivity.csv  (--source_response_col neg_log2_auc)
+target_response: 同上 TCGA PMID 表
+```
+
+### 26.4 `experiment_multilabel_ssda.py` 編排（對照改寫）
+
+```python
+# 1. parse CLI / smoke_test 展開 SMOKE_*_ARGS
+config = config_from_args(args)
+set_global_seed(config.random_seed)
+
+# 2. 輸出
+writer = ArtifactWriter(config.latent_output_dir, config.random_seed)
+writer.write_config(config)
+
+# 3. 資料（唯一大塊邏輯在 prepare.py）
+prepared = prepare_multilabel_data(config)
+writer.write_preparation_artifacts(drug_index, alignment_report)
+
+# 4. 每 fold
+for fold in prepared.folds:
+    model = build_model(n_features, n_drugs, ...)
+    trainer.train_fold(prepared, fold)          # 訓練 + val，不更新 val
+    predict_matrix → long tables + metrics
+    encode_latent_dict(完整 so.x / to.x) → pkl
+    t-SNE / FID / MMD / KMeans
+
+# 5. 跨 fold 彙總 CSV（reports.py）
+```
+
+**Source 指標過濾：** `_filter_source_test(pred)` 只保留 `split == "source_test"`。
+
+**Target 指標：** 不過濾 split；所有 `mask=1` 的 observed positions 都進 metrics。
+
+### 26.5 實際套件配置（`ssda_multilabel/`）
+
+| 模組 | 職責 |
+|------|------|
+| `config.py` | CLI、`MultiLabelConfig`、扁平 `resolve_multilabel_output_dir` |
+| `prepare.py` | `prepare_multilabel_data` 總控 |
+| `omics_io.py` | omics 讀取、feature 交集 |
+| `response_matrix.py` | long → wide + duplicate 策略 |
+| `masks.py` | target n-shot labeled / unlabeled |
+| `split.py` | source test + K-fold |
+| `sample_id.py` | TCGA key、join |
+| `drug_index.py` / `drug_normalize.py` | drug_list |
+| `cancer_type.py` | 自動路徑 + mapping |
+| `model.py` / `losses.py` / `adaptation.py` / `training.py` | 訓練 |
+| `prediction.py` / `metrics.py` | 預測與評估 |
+| `latent.py` / `latent_eval.py` | pkl、t-SNE、FID/MMD、KMeans |
+| `export.py` | `ArtifactWriter` |
+| `reports.py` | 跨 fold mean/std |
+
+### 26.6 訓練損失（每 epoch）
+
+```text
+L = L_source_sup(mask_source, train∪val indices 依 fold)
+  + L_target_sup(mask_target_labeled)
+  + lambda_adapt * L_adentropy(mask_target_unlabeled)
+```
+
+- **classification：** source/target supervised 用 masked BCE；target unlabeled 用 sigmoid entropy adaptation。
+- **regression：** source 用 masked MAE/MSE/Huber；target labeled 仍 BCE；target unlabeled 仍 adaptation。
+
+### 26.7 實作心得（避免重踩）
+
+1. **不要**在 validation step 呼叫會 `backward` 的舊 `trainer.py`。
+2. **不要**用 DAE 隨機 denoising forward 匯出 latent；用 `model.encode(..., deterministic=True)`。
+3. **不要**假設 target 有 regression 連續標籤；target 指標永遠走 classification。
+4. **不要**把 target n-shot 做成 sample-level split（會錯殺其他 drug 的 label）。
+5. **不要**在磁碟重複輸出巨大 wide matrix（已在記憶體即可）。
+6. Cancer type 與 omics ID 型態不同時（pretrain `Unnamed: 0` vs `Sample_ID`），靠 `cancer_type.py` profile 對應，勿硬編一種欄位名到所有表。
+7. Docker 內用 `python`（有 pandas/torch），`python3` 可能是系統精簡版。
+
+### 26.8 完成定義（本階段）
+
+當 §22.0 全部節點通過，且 §23 Completion Criteria 1–17 滿足時，視為 `experiment_multilabel_ssda.py` 本階段完成；後續若改 `experiment_shot.py` 行為，應先更新本節與 `design.md` §14 再動程式。
