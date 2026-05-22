@@ -59,7 +59,8 @@ htmlcov/
 ### experiment_shot.py | experiment_shot_ssda.py | experiment_multilabel_ssda.py
 ### ---------------------------------------------------------------------------
 save/
-outputs/
+# All run roots: outputs/, outputs_classification/, outputs_smoke_*/, etc.
+outputs*/
 runs/
 run/
 
@@ -77,8 +78,8 @@ legacy/
 # Per-fold / per-seed run directories (under output roots only)
 save/**/fold_*/
 save/**/seed_*/
-outputs/**/fold_*/
-outputs/**/seed_*/
+outputs*/**/fold_*/
+outputs*/**/seed_*/
 runs/**/fold_*/
 runs/**/seed_*/
 
@@ -88,8 +89,8 @@ run.log
 # Training / eval CSV & JSON under output roots
 save/**/config.json
 save/**/*.csv
-outputs/**/config.json
-outputs/**/*.csv
+outputs*/**/config.json
+outputs*/**/*.csv
 runs/**/config.json
 runs/**/*.csv
 
@@ -97,8 +98,8 @@ runs/**/*.csv
 save/**/tsne_*.png
 save/**/tsne_*.pdf
 save/**/umap_*.png
-outputs/**/tsne_*.png
-outputs/**/tsne_*.pdf
+outputs*/**/tsne_*.png
+outputs*/**/tsne_*.pdf
 runs/**/tsne_*.png
 
 ### SSDA4Drug — datasets (regenerable via preprocess_benchmark.py)
