@@ -175,7 +175,7 @@ class FineTuneRunner:
                 raise ValueError("fine-tune requires pretrain_checkpoint")
             load_report = load_pretrain_checkpoint(model, ckpt_path)
             writer.write_checkpoint_load_report(fold.fold_id, load_report)
-            trainer = build_trainer(model, self.config)
+            trainer = build_trainer(model, self.config, n_features=n_features)
             result, bundle = trainer.train_fold(fold, prepared, str(fold_dir))
             load_finetune_checkpoint(model, result.best_model_path)
             model.eval()

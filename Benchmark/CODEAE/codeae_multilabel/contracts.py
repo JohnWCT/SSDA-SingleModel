@@ -58,10 +58,19 @@ class CodeAEMultilabelConfig:
     max_drugs: Optional[int] = None
     freeze_encoder_initially: bool = True
     progressive_unfreeze: bool = True
+    finetune_domain_loss: Literal["none", "coral", "mmd", "adversarial"] = "none"
+    finetune_domain_lambda: float = 0.0
+    finetune_domain_warmup_epochs: int = 0
+    finetune_wgan_gp: float = 10.0
+    finetune_gen_every: int = 5
 
     @property
     def n_drugs_hint(self) -> Optional[int]:
         return None
+
+    @property
+    def uses_finetune_unlabeled_loss(self) -> bool:
+        return self.finetune_domain_loss != "none"
 
 
 @dataclass(frozen=True)

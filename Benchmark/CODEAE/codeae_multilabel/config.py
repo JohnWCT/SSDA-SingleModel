@@ -199,6 +199,42 @@ def build_finetune_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Progressively add encoder Linear layers to optimizer on validation plateau",
     )
+    p.add_argument(
+        "--finetune_domain_loss",
+        choices=["none", "coral", "mmd", "adversarial"],
+        default="none",
+        help="Fine-tune domain loss (default none = CODE-AE upstream supervised-only fine-tune)",
+    )
+    p.add_argument(
+        "--finetune_domain_lambda",
+        type=float,
+        default=0.0,
+        help="Weight for optional fine-tune domain loss (when not none)",
+    )
+    p.add_argument(
+        "--finetune_domain_warmup_epochs",
+        type=int,
+        default=0,
+        help="Epochs before applying fine-tune domain loss",
+    )
+    p.add_argument(
+        "--finetune_domain_adaptation",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Deprecated alias: sets --finetune_domain_loss adversarial when enabled",
+    )
+    p.add_argument(
+        "--finetune_wgan_gp",
+        type=float,
+        default=10.0,
+        help="Gradient penalty weight for fine-tune confounder critic (upstream pretrain uses 10)",
+    )
+    p.add_argument(
+        "--finetune_gen_every",
+        type=int,
+        default=5,
+        help="Apply generator adversarial loss every N training steps (upstream pretrain uses 5)",
+    )
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--seed", type=int, default=2020)
@@ -219,6 +255,18 @@ def build_finetune_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_samples", type=int, default=None)
     p.add_argument("--max_drugs", type=int, default=None)
     return p
+
+
+def _finetune_domain_loss_fields(args: argparse.Namespace) -> dict[str, Any]:
+    domain_loss = str(getattr(args, "finetune_domain_loss", "none") or "none")
+    legacy_adv = getattr(args, "finetune_domain_adaptation", None)
+    if legacy_adv is True:
+        domain_loss = "adversarial"
+    return {
+        "finetune_domain_loss": domain_loss,
+        "finetune_domain_lambda": float(getattr(args, "finetune_domain_lambda", 0.0)),
+        "finetune_domain_warmup_epochs": int(getattr(args, "finetune_domain_warmup_epochs", 0)),
+    }
 
 
 def _resolve_hyperparams(
@@ -312,6 +360,9 @@ def _base_config_dict(
             getattr(args, "freeze_encoder_initially", True)
         ),
         "progressive_unfreeze": bool(getattr(args, "progressive_unfreeze", True)),
+        **_finetune_domain_loss_fields(args),
+        "finetune_wgan_gp": float(getattr(args, "finetune_wgan_gp", 10.0)),
+        "finetune_gen_every": int(getattr(args, "finetune_gen_every", 5)),
         "device": device,
         "retrain_flag": bool(args.retrain_flag),
         "es_flag": False,

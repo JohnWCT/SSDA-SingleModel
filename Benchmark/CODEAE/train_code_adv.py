@@ -260,6 +260,10 @@ def train_code_adv(s_dataloaders, t_dataloaders, **kwargs):
 
         torch.save(s_dsnae.state_dict(), os.path.join(kwargs['model_save_folder'], 'a_s_dsnae.pt'))
         torch.save(t_dsnae.state_dict(), os.path.join(kwargs['model_save_folder'], 'a_t_dsnae.pt'))
+        torch.save(
+            confounding_classifier.state_dict(),
+            os.path.join(kwargs['model_save_folder'], 'confounding_classifier.pt'),
+        )
 
     else:
         try:
