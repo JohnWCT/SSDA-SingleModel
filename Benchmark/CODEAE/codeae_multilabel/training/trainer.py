@@ -9,6 +9,7 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from torch.optim import AdamW
 
 from codeae_multilabel.contracts import (
@@ -26,7 +27,10 @@ from codeae_multilabel.data.dataloader import (
 from codeae_multilabel.evaluation.metrics import compute_metrics_from_predictions
 from codeae_multilabel.evaluation.prediction import build_prediction_long_table
 from codeae_multilabel.contracts import PredictionBundle
-from codeae_multilabel.model.checkpoint import save_finetune_checkpoint
+from codeae_multilabel.model.checkpoint import (
+    load_finetune_checkpoint,
+    save_finetune_checkpoint,
+)
 from codeae_multilabel.model.wrapper import MultiLabelCodeAEModel
 from codeae_multilabel.training.codeae_loss_adapter import CodeAELossAdapter
 from codeae_multilabel.training.losses import masked_bce_with_logits, masked_mae
@@ -37,6 +41,27 @@ from codeae_multilabel.training.train_state import EpochLog, epoch_logs_to_dataf
 def _omics_array(omics_x: Any, sample_ids: list[str]) -> np.ndarray:
     arr: np.ndarray = omics_x.loc[list(sample_ids)].values.astype(np.float32)
     return arr
+
+
+def _set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
+    for param in module.parameters():
+        param.requires_grad = requires_grad
+
+
+def _encoder_linear_layers_unfreeze_order(core: nn.Module) -> list[nn.Linear]:
+    layers = [m for m in core.modules() if isinstance(m, nn.Linear)]
+    return list(reversed(layers))
+
+
+def _trainable_parameters(model: nn.Module) -> list[torch.nn.Parameter]:
+    return [p for p in model.parameters() if p.requires_grad]
+
+
+def setup_finetune_parameter_freeze(
+    model: MultiLabelCodeAEModel, *, freeze_encoder: bool
+) -> None:
+    _set_requires_grad(model.codeae_core, not freeze_encoder)
+    _set_requires_grad(model.prediction_head, True)
 
 
 class CodeAEMultilabelTrainer:
@@ -96,6 +121,34 @@ class CodeAEMultilabelTrainer:
         per, summ = compute_metrics_from_predictions(pred_df, self.config.task_type, "source")
         return per, summ
 
+    def _maybe_progressive_unfreeze(
+        self,
+        *,
+        encoder_layers: list[nn.Linear],
+        best_path: str,
+        best_epoch: int,
+        epochs_since_best: int,
+        reset_count: int,
+        current_lr: float,
+    ) -> tuple[list[nn.Linear], int, int, float, bool]:
+        """Return updated state and whether to stop training (encoder layers exhausted)."""
+        if not self.config.progressive_unfreeze:
+            return encoder_layers, reset_count, epochs_since_best, current_lr, False
+
+        tolerance = self.config.early_stopping_tolerance
+        if epochs_since_best <= tolerance * reset_count or best_epoch <= 0:
+            return encoder_layers, reset_count, epochs_since_best, current_lr, False
+
+        if not encoder_layers:
+            return encoder_layers, reset_count, epochs_since_best, current_lr, True
+
+        load_finetune_checkpoint(self.model, best_path, map_location=self.device)
+        layer = encoder_layers.pop(0)
+        _set_requires_grad(layer, True)
+        current_lr *= self.config.decay_coefficient
+        self.optimizer = AdamW(_trainable_parameters(self.model), lr=current_lr)
+        return encoder_layers, reset_count + 1, 0, current_lr, False
+
     def train_fold(
         self,
         fold: SourceFold,
@@ -136,7 +189,19 @@ class CodeAEMultilabelTrainer:
         logs: list[EpochLog] = []
         target_cycle = cycle(target_loader)
         n_epochs = self.config.train_num_epochs
+
+        encoder_layers = (
+            _encoder_linear_layers_unfreeze_order(self.model.codeae_core)
+            if self.config.progressive_unfreeze
+            else []
+        )
+        reset_count = 1
+        current_lr = self.config.lr
+        epochs_since_best = 0
+
         for epoch in range(n_epochs):
+            if epoch % 50 == 0 and self.config.progressive_unfreeze:
+                print(f"Fine tuning epoch {epoch}")
             self.model.train()
             epoch_losses: list[float] = []
             for source_batch in train_loader:
@@ -170,17 +235,37 @@ class CodeAEMultilabelTrainer:
                 best_metric_value = metric_value
                 best_metric_name = metric_name
                 best_epoch = epoch
+                epochs_since_best = 0
                 save_finetune_checkpoint(
                     self.model,
                     self.optimizer,
                     {"epoch": epoch, "metric_name": metric_name, "metric_value": metric_value},
                     best_path,
                 )
+            else:
+                epochs_since_best += 1
+
+            encoder_layers, reset_count, epochs_since_best, current_lr, stop_training = (
+                self._maybe_progressive_unfreeze(
+                    encoder_layers=encoder_layers,
+                    best_path=best_path,
+                    best_epoch=best_epoch,
+                    epochs_since_best=epochs_since_best,
+                    reset_count=reset_count,
+                    current_lr=current_lr,
+                )
+            )
+            if stop_training:
+                break
+
         if best_epoch < 0:
             best_epoch = n_epochs - 1
             best_metric_name = self.config.metric or "macro_auroc"
             best_metric_value = float("nan")
             save_finetune_checkpoint(self.model, self.optimizer, {}, best_path)
+        elif Path(best_path).is_file():
+            load_finetune_checkpoint(self.model, best_path, map_location=self.device)
+
         bundle = self._evaluate_all_splits(
             fold, prepared, val_loader, test_loader, target_eval_loader
         )
@@ -266,5 +351,14 @@ class CodeAEMultilabelTrainer:
 def build_trainer(
     model: MultiLabelCodeAEModel, config: CodeAEMultilabelConfig
 ) -> CodeAEMultilabelTrainer:
-    optimizer = AdamW(model.parameters(), lr=config.lr)
+    freeze_core = config.freeze_encoder_initially or config.progressive_unfreeze
+    if freeze_core:
+        setup_finetune_parameter_freeze(model, freeze_encoder=True)
+    if config.progressive_unfreeze:
+        trainable = list(model.prediction_head.parameters())
+    elif config.freeze_encoder_initially:
+        trainable = list(model.prediction_head.parameters())
+    else:
+        trainable = list(model.parameters())
+    optimizer = AdamW(trainable, lr=config.lr)
     return CodeAEMultilabelTrainer(model, optimizer, config)

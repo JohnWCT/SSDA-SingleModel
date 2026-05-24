@@ -56,6 +56,8 @@ class CodeAEMultilabelConfig:
     es_flag: bool = False
     max_samples: Optional[int] = None
     max_drugs: Optional[int] = None
+    freeze_encoder_initially: bool = True
+    progressive_unfreeze: bool = True
 
     @property
     def n_drugs_hint(self) -> Optional[int]:

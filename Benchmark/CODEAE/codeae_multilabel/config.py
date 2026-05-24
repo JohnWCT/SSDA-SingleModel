@@ -181,6 +181,24 @@ def build_finetune_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Encoder unfreeze LR decay (upstream labeled default 0.1)",
     )
+    p.add_argument(
+        "--early_stopping_tolerance",
+        type=int,
+        default=None,
+        help="Validation plateau epochs before progressive unfreeze (upstream default 10)",
+    )
+    p.add_argument(
+        "--freeze_encoder_initially",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Freeze codeae_core at fine-tune start (matches upstream decoder-only phase)",
+    )
+    p.add_argument(
+        "--progressive_unfreeze",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Progressively add encoder Linear layers to optimizer on validation plateau",
+    )
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--seed", type=int, default=2020)
@@ -285,7 +303,15 @@ def _base_config_dict(
         "alpha": float(tp.get("alpha", 1.0)),
         "dop": dop,
         "decay_coefficient": decay_coefficient,
-        "early_stopping_tolerance": UPSTREAM_EARLY_STOPPING_TOLERANCE,
+        "early_stopping_tolerance": (
+            int(args.early_stopping_tolerance)
+            if getattr(args, "early_stopping_tolerance", None) is not None
+            else UPSTREAM_EARLY_STOPPING_TOLERANCE
+        ),
+        "freeze_encoder_initially": bool(
+            getattr(args, "freeze_encoder_initially", True)
+        ),
+        "progressive_unfreeze": bool(getattr(args, "progressive_unfreeze", True)),
         "device": device,
         "retrain_flag": bool(args.retrain_flag),
         "es_flag": False,
