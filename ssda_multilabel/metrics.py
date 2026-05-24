@@ -87,23 +87,55 @@ def compute_classification_metrics_per_drug(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _metrics_summary(per_drug: pd.DataFrame, metrics: tuple[str, ...]) -> pd.DataFrame:
+def _metrics_summary(
+    per_drug: pd.DataFrame,
+    metrics: tuple[str, ...],
+    overall: dict[str, float] | None = None,
+) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for m in metrics:
         vals = per_drug[m].dropna()
-        rows.append({"metric": m, "macro": float(vals.mean()) if len(vals) else float("nan")})
+        row: dict[str, object] = {
+            "metric": m,
+            "macro": float(vals.mean()) if len(vals) else float("nan"),
+        }
         w = np.asarray(per_drug["n"].values, dtype=np.float64)
         v = np.asarray(per_drug[m].values, dtype=np.float64)
         mask = ~np.isnan(v)
         if mask.any():
-            rows[-1]["weighted"] = float(np.average(v[mask], weights=w[mask]))
+            row["weighted"] = float(np.average(v[mask], weights=w[mask]))
         else:
-            rows[-1]["weighted"] = float("nan")
+            row["weighted"] = float("nan")
+        if overall is not None:
+            row["overall"] = overall.get(m, float("nan"))
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
-def compute_classification_metrics_summary(per_drug: pd.DataFrame) -> pd.DataFrame:
-    return _metrics_summary(per_drug, CLASSIFICATION_METRICS)
+def compute_classification_metrics_overall(df: pd.DataFrame) -> dict[str, float]:
+    """Pooled metrics: all observed sample-drug pairs as one set."""
+    if df.empty:
+        return {m: float("nan") for m in CLASSIFICATION_METRICS}
+    y = np.asarray(df["ground_truth"].astype(int).values)
+    y_score = _classification_scores(df)
+    pred = np.asarray(df["pred_label"].astype(int).values)
+    return {
+        "auc": _safe_auc(y, y_score),
+        "aupr": _safe_aupr(y, y_score),
+        "accuracy": float(accuracy_score(y, pred)),
+        "f1": float(f1_score(y, pred, zero_division=0)),
+        "precision": float(precision_score(y, pred, zero_division=0)),
+        "recall": float(recall_score(y, pred, zero_division=0)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+    }
+
+
+def compute_classification_metrics_summary(
+    per_drug: pd.DataFrame,
+    df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    overall = compute_classification_metrics_overall(df) if df is not None else None
+    return _metrics_summary(per_drug, CLASSIFICATION_METRICS, overall)
 
 
 def compute_regression_metrics_per_drug(df: pd.DataFrame) -> pd.DataFrame:
@@ -133,8 +165,35 @@ def compute_regression_metrics_per_drug(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def compute_regression_metrics_summary(per_drug: pd.DataFrame) -> pd.DataFrame:
-    return _metrics_summary(per_drug, REGRESSION_METRICS)
+def compute_regression_metrics_overall(df: pd.DataFrame) -> dict[str, float]:
+    """Pooled metrics: all observed sample-drug pairs as one set."""
+    if df.empty:
+        return {m: float("nan") for m in REGRESSION_METRICS}
+    y = np.asarray(df["ground_truth"].astype(float).values)
+    p = np.asarray(df["pred_score"].astype(float).values)
+    mae = float(mean_absolute_error(y, p))
+    rmse = float(np.sqrt(mean_squared_error(y.tolist(), p.tolist())))
+    r2 = float(r2_score(y, p)) if len(y) > 1 else float("nan")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        y_std = float(np.std(y.astype(np.float64)))
+        pr = pearsonr(y, p)[0] if len(y) > 1 and y_std > 0 else float("nan")
+        sp = spearmanr(y, p).correlation if len(y) > 1 else float("nan")
+    return {
+        "mae": mae,
+        "rmse": rmse,
+        "r2": r2,
+        "pearson": float(pr) if pr == pr else float("nan"),
+        "spearman": float(sp) if sp == sp else float("nan"),
+    }
+
+
+def compute_regression_metrics_summary(
+    per_drug: pd.DataFrame,
+    df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    overall = compute_regression_metrics_overall(df) if df is not None else None
+    return _metrics_summary(per_drug, REGRESSION_METRICS, overall)
 
 
 def compute_metrics_from_predictions(
@@ -144,8 +203,8 @@ def compute_metrics_from_predictions(
     sub = df[df["domain"] == domain] if "domain" in df.columns else df
     if task_type == "regression" and domain == "source":
         per = compute_regression_metrics_per_drug(sub)
-        summ = compute_regression_metrics_summary(per)
+        summ = compute_regression_metrics_summary(per, sub)
         return per, summ
     per = compute_classification_metrics_per_drug(sub)
-    summ = compute_classification_metrics_summary(per)
+    summ = compute_classification_metrics_summary(per, sub)
     return per, summ

@@ -41,6 +41,7 @@ def build_prediction_long_table(
     fold: int,
     seed: int,
     cancer_types: dict[str, str] | None = None,
+    target_labeled_mask: NDArray[np.float32] | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for i, sid in enumerate(sample_ids):
@@ -57,13 +58,19 @@ def build_prediction_long_table(
             else:
                 pred_label = int(prob >= 0.5)
                 confidence = score
+            if domain == "target" and target_labeled_mask is not None:
+                target_role = (
+                    "target_labeled" if target_labeled_mask[i, j] > 0 else "target_unlabeled"
+                )
+            else:
+                target_role = split_or_role[i] if domain == "target" else ""
             row: dict[str, object] = {
                 "sample_id": sid,
                 "drug_id": did,
                 "drug_index": j,
                 "domain": domain,
                 "split": split_or_role[i] if domain == "source" else "",
-                "target_role": split_or_role[i] if domain == "target" else "",
+                "target_role": target_role,
                 "ground_truth": float(y[i, j]),
                 "mask": 1,
                 "pred_score": score,
@@ -78,3 +85,20 @@ def build_prediction_long_table(
                 row["cancer_type"] = cancer_types.get(sid, "Unknown")
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def filter_target_eval_predictions(
+    pred_df: pd.DataFrame,
+    unlabeled_mask: NDArray[np.float32],
+    sample_ids: list[str],
+) -> pd.DataFrame:
+    """Exclude n-shot labeled positions; keep only target unlabeled positions for eval."""
+    if pred_df.empty:
+        return pred_df
+    sid_to_idx = {sid: i for i, sid in enumerate(sample_ids)}
+    sample_idx = pred_df["sample_id"].map(sid_to_idx).fillna(-1).astype(int).to_numpy()
+    drug_idx = pred_df["drug_index"].astype(int).to_numpy()
+    valid = sample_idx >= 0
+    keep = np.zeros(len(pred_df), dtype=bool)
+    keep[valid] = unlabeled_mask[sample_idx[valid], drug_idx[valid]] > 0
+    return pred_df.loc[keep].reset_index(drop=True)

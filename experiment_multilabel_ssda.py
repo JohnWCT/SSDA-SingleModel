@@ -71,12 +71,17 @@ from ssda_multilabel.latent_eval import (
 )
 from ssda_multilabel.metrics import compute_metrics_from_predictions
 from ssda_multilabel.model import build_model
-from ssda_multilabel.prediction import build_prediction_long_table, predict_matrix
+from ssda_multilabel.prediction import (
+    build_prediction_long_table,
+    filter_target_eval_predictions,
+    predict_matrix,
+)
 from ssda_multilabel.prepare import prepare_multilabel_data
 from ssda_multilabel.reports import (
     aggregate_per_drug_metrics,
     aggregate_scalar_metrics,
     aggregate_summary_metrics,
+    build_combined_eval_summary,
 )
 from ssda_multilabel.seed import set_global_seed
 from ssda_multilabel.training import MultiLabelSSDTrainer, epoch_logs_to_dataframe
@@ -199,21 +204,25 @@ def main() -> None:
             fold.fold_id,
             config.random_seed,
             cancer_map,
+            target_labeled_mask=tm.labeled_mask,
         )
         writer.write_fold_csv(fold.fold_id, "source_prediction_results.csv", src_pred)
         writer.write_fold_csv(fold.fold_id, "target_prediction_results.csv", tgt_pred)
 
         src_eval = _filter_source_test(src_pred)
+        tgt_eval = filter_target_eval_predictions(
+            tgt_pred, tm.unlabeled_mask, list(to.sample_ids)
+        )
         if config.task_type == "classification":
             src_per, src_sum = compute_metrics_from_predictions(
                 src_eval, "classification", "source"
             )
             tgt_per, tgt_sum = compute_metrics_from_predictions(
-                tgt_pred, "classification", "target"
+                tgt_eval, "classification", "target"
             )
         else:
             src_per, src_sum = compute_metrics_from_predictions(src_eval, "regression", "source")
-            tgt_per, tgt_sum = compute_metrics_from_predictions(tgt_pred, "regression", "target")
+            tgt_per, tgt_sum = compute_metrics_from_predictions(tgt_eval, "regression", "target")
 
         writer.write_fold_csv(fold.fold_id, "source_metrics_per_drug.csv", src_per)
         writer.write_fold_csv(fold.fold_id, "source_metrics_summary.csv", src_sum)
@@ -287,6 +296,11 @@ def main() -> None:
         writer.write_summary(
             "target_eval_metrics_summary_fold_mean_std.csv",
             aggregate_summary_metrics(all_tgt_summary),
+        )
+    if all_src_summary or all_tgt_summary:
+        writer.write_summary(
+            "eval_metrics_summary_fold_mean_std.csv",
+            build_combined_eval_summary(all_src_summary, all_tgt_summary),
         )
     if all_src_per_drug:
         writer.write_summary(

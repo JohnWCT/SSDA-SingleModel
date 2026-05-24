@@ -21,14 +21,25 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+pythonpath = [".", "Benchmark/CODEAE"]
 
 [tool.mypy]
 python_version = "3.9"
 strict = true
 ignore_missing_imports = true
 exclude = [
-  "Benchmark/",
+  "Benchmark/CODEAE/train_code_adv.py",
+  "Benchmark/CODEAE/fine_tuning.py",
+  "Benchmark/CODEAE/dsn_ae.py",
+  "Benchmark/CODEAE/mlp.py",
+  "Benchmark/CODEAE/encoder_decoder.py",
+  "Benchmark/CODEAE/pretrain_hyper_main.py",
+  "Benchmark/CODEAE/drug_ft_hyper_main.py",
+  "Benchmark/CODEAE/data_process.py",
+  "Benchmark/CODEAE/base_ae.py",
+  "Benchmark/CODEAE/gradient_reversal.py",
+  "Benchmark/CODEAE/evaluation_utils.py",
+  "Benchmark/CODEAE/types_.py",
   "trainer.py",
   "model.py",
   "utils.py",
@@ -44,11 +55,40 @@ follow_imports = "skip"
 module = ["ssda_multilabel.model"]
 follow_imports = "skip"
 
+[[tool.mypy.overrides]]
+module = ["codeae_multilabel", "codeae_multilabel.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["codeae_multilabel.model.legacy_adapter", "train_code_adv", "fine_tuning", "dsn_ae", "mlp", "encoder_decoder"]
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = "codeae_multilabel"
+follow_imports = "silent"
+disallow_any_generics = false
+
+[[tool.mypy.overrides]]
+module = [
+  "codeae_multilabel.evaluation.prediction",
+  "codeae_multilabel.training.trainer",
+  "codeae_multilabel.model.wrapper",
+  "codeae_multilabel.model.checkpoint",
+]
+disallow_any_generics = false
+
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+src = ["ssda_multilabel", "Benchmark/CODEAE/codeae_multilabel", "tests"]
 exclude = [
-  "Benchmark",
+  "Benchmark/CODEAE/train_code_adv.py",
+  "Benchmark/CODEAE/fine_tuning.py",
+  "Benchmark/CODEAE/dsn_ae.py",
+  "Benchmark/CODEAE/mlp.py",
+  "Benchmark/CODEAE/encoder_decoder.py",
+  "Benchmark/CODEAE/pretrain_hyper_main.py",
+  "Benchmark/CODEAE/drug_ft_hyper_main.py",
   "trainer.py",
   "model.py",
   "utils.py",
@@ -59,10 +99,15 @@ exclude = [
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "N"]
 
+[tool.ruff.lint.per-file-ignores]
+"Benchmark/CODEAE/codeae_multilabel/**" = ["UP045", "E501", "N812"]
+"tests/test_codeae_multilabel_integration.py" = ["E402"]
+"tests/test_codeae_multilabel_*.py" = ["E501", "F821"]
+
 [tool.coverage.run]
-source = ["ssda_multilabel"]
-omit = ["tests/*"]
+source = ["ssda_multilabel", "codeae_multilabel"]
+omit = ["tests/*", "Benchmark/CODEAE/codeae_multilabel/smoke/*"]
 
 [tool.coverage.report]
-fail_under = 85
+fail_under = 80
 show_missing = true

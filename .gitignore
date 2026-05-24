@@ -109,8 +109,8 @@ Datasets/processedData/
 ### Benchmark competing methods — local saves
 Benchmark/**/save/
 
-### DAPL-style / misc project outputs
-data/
+### DAPL-style / misc project outputs (repo-root only; not package subpackages named data/)
+/data/
 weights/
 result/
 finetune_result/
