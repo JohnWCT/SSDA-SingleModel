@@ -48,6 +48,8 @@ class CodeAEMultilabelConfig:
     norm_flag: bool
     alpha: float
     dop: float
+    decay_coefficient: float
+    early_stopping_tolerance: int
     duplicate_strategy: Literal["mean", "median", "first", "error"]
     device: str
     retrain_flag: bool = True

@@ -12,7 +12,10 @@ PYTHONPATH=Benchmark/CODEAE:$PYTHONPATH \
 
 Modes: `all`, `cls`, `reg`, `pretrain`, `finetune_cls`, `finetune_reg`.
 
-Smoke defaults: `--epochs 1`, `--batch_size 32`, `--max_samples 128`, `--max_drugs 24`, `--n_splits 2`.
+Smoke defaults: `--epochs 1` (WGAN only), `--batch_size 32`, `--max_samples 512`, `--n_splits 2`.
+Production pretrain uses upstream [CODE-AE train_params.json](https://github.com/XieResearchGroup/CODE-AE/blob/main/code/model_save/train_params.json) unlabeled: `pretrain=500`, `train=1000`, `dop=0.1`, encoder `[512,256]`, classifier `[64,32]`.
+Fine-tune uses labeled block: `train_num_epochs=2000`, `decay_coefficient=0.1`, `--metric auroc` maps to `macro_auroc`.
+For SSDA4Drug fork pretrain grid (`0/100/0.0`), add `--ssda_benchmark_grid` to pretrain only.
 
 ## Pretrain
 

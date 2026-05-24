@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Thin entry: CODE-AE multilabel fine-tuning."""
+"""Thin entry: CODE-AE multilabel fine-tuning.
+
+Hyperparameters follow upstream CODE-AE drug_ft_hyper_main.py:
+  train_params.json labeled block + root keys via wrap_training_params.
+See codeae_multilabel.config.load_train_params(section='labeled').
+"""
 
 from __future__ import annotations
 
